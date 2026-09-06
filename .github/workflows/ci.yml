@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Установить зависимости
+        run: pip install flask requests
+
+      - name: Проверить синтаксис
+        run: python -m py_compile evolute_api.py
+
+      - name: Проверить, что модуль импортируется
+        # импорт не запускает сервер: app.run() под if __name__ == "__main__"
+        run: python -c "import evolute_api; print('ok, routes:', len(list(evolute_api.app.url_map.iter_rules())))"
