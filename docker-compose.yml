@@ -11,3 +11,4 @@ services:
       CAR_ID: "SOME_CAR_ID_HASH_CHANGE_ME"
       API_KEY: "changeme"
       API_KEY_RW: "changeme_rw"
+      # ALLOWED_ORIGIN: "https://<username>.github.io"
