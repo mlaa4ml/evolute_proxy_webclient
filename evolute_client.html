@@ -364,6 +364,32 @@ let findings = [];
 
 function $(id){ return document.getElementById(id); }
 
+/* ---------------------------------------------------------------
+   Хранилище настроек.
+   Раньше страница рассчитывала на внешний объект window.storage,
+   которого в обычном браузере (в т.ч. на GitHub Pages) нет — из-за
+   этого Base URL и ключи не сохранялись между перезагрузками.
+   Ниже — полифилл поверх localStorage с тем же async-интерфейсом.
+   Если внешний window.storage всё-таки есть — используется он.
+--------------------------------------------------------------- */
+if(!window.storage || typeof window.storage.get !== "function"){
+  window.storage = {
+    async get(key){
+      try{
+        const value = window.localStorage.getItem(key);
+        return value === null ? null : { key, value };
+      }catch(e){ return null; }
+    },
+    async set(key, value){
+      try{ window.localStorage.setItem(key, value); return { key, value }; }
+      catch(e){ console.error("localStorage недоступен", e); return null; }
+    },
+    async remove(key){
+      try{ window.localStorage.removeItem(key); }catch(e){}
+    }
+  };
+}
+
 async function loadPersisted(){
   try{
     const r = await window.storage.get("evolute_client:connection", false);
