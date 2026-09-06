@@ -95,6 +95,7 @@
 | `JSON_SUB`     | Путь к данным сенсоров в JSON-ответе (по умолчанию `.sensors`).          |
 | `EVOLUTE_TOKEN_FILENAME` | Имя файла для сохранения токена доступа.                        |
 | `EVOLUTE_REFRESH_TOKEN_FILENAME` | Имя файла для сохранения токена обновления.                |
+| `ALLOWED_ORIGIN` | Origin, которому разрешён доступ к API из браузера (CORS). По умолчанию `*`. Для клиента на GitHub Pages укажи `https://<login>.github.io`. |
 
 
 > ⚠️⚠️⚠️ Приложение не запустится, если `CAR_ID` не задан или оставлен со значением по умолчанию (`SOME_CAR_ID_HASH_CHANGE_ME`).
