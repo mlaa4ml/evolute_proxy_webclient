@@ -359,6 +359,28 @@ const INTELLIGENT_ACTIONS = [
   ["prepare_off", "Прогрев выкл"],
 ];
 
+// Polyfill window.storage with localStorage if window.storage is not provided by the environment
+if (typeof window.storage === 'undefined') {
+  window.storage = {
+    async get(key) {
+      try {
+        const val = localStorage.getItem(key);
+        return val !== null ? { value: val } : null;
+      } catch (e) {
+        return null;
+      }
+    },
+    async set(key, value) {
+      try {
+        localStorage.setItem(key, value);
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+  };
+}
+
 let conn = { baseUrl: "", apiKey: "", apiKeyRw: "" };
 let findings = [];
 
