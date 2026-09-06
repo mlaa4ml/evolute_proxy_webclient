@@ -146,6 +146,14 @@ nano set_token.sh
 bash set_token.sh
 ```
 
+### 🌐 Публикация веб-клиента на GitHub Pages
+
+Статический клиент `evolute_client.html` можно опубликовать на GitHub Pages
+одним workflow (`.github/workflows/pages.yml`), а Flask-прокси при этом
+держать на своём хосте — на Pages/Actions серверная часть работать не может.
+
+Подробная пошаговая инструкция: [docs/GITHUB_PAGES.md](docs/GITHUB_PAGES.md)
+
 ## Настройка Home assistant
 
 - Пример лежит в директории home-assistant
