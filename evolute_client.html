@@ -234,6 +234,7 @@
         <button data-tab="overview" class="active">Обзор</button>
         <button data-tab="actions">Действия</button>
         <button data-tab="explorer">Разведка</button>
+        <button data-tab="history">История</button>
         <button data-tab="findings">Находки</button>
       </nav>
 
@@ -295,6 +296,30 @@
             <button class="primary block" id="explSend">Отправить</button>
           </div>
           <div id="explOut" style="margin-top:10px;"></div>
+        </div>
+      </div>
+
+      <div class="tabpane" id="tab-history">
+        <div class="panel">
+          <div class="toolbar">
+            <h2 style="margin:0;">История сенсоров</h2>
+            <div class="grow"></div>
+            <input id="histSensorsLimit" value="100" style="width:70px;flex:none;" title="limit">
+            <input id="histSensorsSince" placeholder="since (ISO, опц.)" style="width:180px;flex:none;">
+            <button id="getHistSensors">Загрузить</button>
+          </div>
+          <p class="hint">Снимки <code>/sensors/all</code>, которые прокси сам сохраняет каждые ~2 минуты (см. SENSORS_REFRESH_INTERVAL)</p>
+          <div id="histSensorsOut"><p class="empty">нет данных</p></div>
+        </div>
+        <div class="panel">
+          <div class="toolbar">
+            <h2 style="margin:0;">История токенов</h2>
+            <div class="grow"></div>
+            <input id="histTokensLimit" value="100" style="width:70px;flex:none;" title="limit">
+            <button id="getHistTokens">Загрузить</button>
+          </div>
+          <p class="hint">События <code>success</code> / <code>403</code> / <code>error</code> при каждом обновлении токена</p>
+          <div id="histTokensOut"><p class="empty">нет данных</p></div>
         </div>
       </div>
 
@@ -510,6 +535,41 @@ function renderKv(container, obj){
   container.appendChild(toggle);
 }
 
+function renderHistoryRows(container, rows, isTokens){
+  container.innerHTML = "";
+  if(!rows || !rows.length){ container.innerHTML = '<p class="empty">нет данных</p>'; return; }
+  const table = document.createElement("table");
+  table.className = "kv";
+  const header = document.createElement("tr");
+  header.innerHTML = isTokens
+    ? '<td class="k">время (UTC)</td><td>событие</td><td>детали</td>'
+    : '<td class="k">время (UTC)</td><td>данные</td>';
+  table.appendChild(header);
+  for(const row of rows){
+    const tr = document.createElement("tr");
+    if(isTokens){
+      tr.innerHTML = `<td class="k">${escapeHtml(row.ts || "")}</td><td>${escapeHtml(row.event || "")}</td><td>${escapeHtml(row.detail || "")}</td>`;
+    } else {
+      const summary = JSON.stringify(row.data);
+      const short = summary.length > 160 ? summary.slice(0, 160) + "…" : summary;
+      tr.innerHTML = `<td class="k">${escapeHtml(row.ts || "")}</td><td>${escapeHtml(short)}</td>`;
+      tr.style.cursor = "pointer";
+      tr.title = "клик — полный JSON снимка";
+      tr.onclick = () => {
+        renderJson(container, row.data);
+        const back = document.createElement("button");
+        back.className = "small";
+        back.textContent = "← назад к списку";
+        back.style.marginTop = "8px";
+        back.onclick = () => renderHistoryRows(container, rows, isTokens);
+        container.appendChild(back);
+      };
+    }
+    table.appendChild(tr);
+  }
+  container.appendChild(table);
+}
+
 // ---- wiring ----
 
 $("saveConn").onclick = async () => { await persistConn(); alert("Сохранено."); };
@@ -556,6 +616,21 @@ $("getSingleSensor").onclick = async () => {
   if(!name) return;
   try{ const data = await call("GET", "/sensors/" + encodeURIComponent(name), { rw:true }); renderJson($("singleSensorOut"), data); }
   catch(e){ renderJson($("singleSensorOut"), e.data || e.message); }
+};
+
+$("getHistSensors").onclick = async () => {
+  const limit = $("histSensorsLimit").value.trim() || "100";
+  const since = $("histSensorsSince").value.trim();
+  let path = "/history/sensors?limit=" + encodeURIComponent(limit);
+  if(since) path += "&since=" + encodeURIComponent(since);
+  try{ const data = await call("GET", path); renderHistoryRows($("histSensorsOut"), data, false); }
+  catch(e){ $("histSensorsOut").innerHTML = `<p class="empty">нет данных / ошибка</p>`; }
+};
+
+$("getHistTokens").onclick = async () => {
+  const limit = $("histTokensLimit").value.trim() || "100";
+  try{ const data = await call("GET", "/history/tokens?limit=" + encodeURIComponent(limit)); renderHistoryRows($("histTokensOut"), data, true); }
+  catch(e){ $("histTokensOut").innerHTML = `<p class="empty">нет данных / ошибка</p>`; }
 };
 
 function buildActionGrid(container, actions, endpointPrefix){
