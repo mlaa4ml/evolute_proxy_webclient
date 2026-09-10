@@ -3,6 +3,7 @@ import json
 import time
 import logging
 import threading
+import sqlite3
 import sys
 import requests
 from flask import Flask, request, jsonify, abort
@@ -22,6 +23,12 @@ JSON_SUB = os.getenv("JSON_SUB", ".sensors")
 EVOLUTE_TOKEN_FILENAME = os.getenv("EVOLUTE_TOKEN_FILENAME", "evy-platform-access.txt")
 EVOLUTE_REFRESH_TOKEN_FILENAME = os.getenv("EVOLUTE_REFRESH_TOKEN_FILENAME", "evy-platform-refresh.txt")
 CAR_ID = os.getenv("CAR_ID", "SOME_CAR_ID_HASH_CHANGE_ME")
+
+# По умолчанию — относительный путь (как раньше у токенов). На Railway задайте
+# DB_FILE=/data/evolute.db в Variables, чтобы файл жил в уже подключённом Volume
+# и переживал редеплои, как и токены.
+DB_FILE = os.getenv("DB_FILE", "evolute_history.db")
+HISTORY_RETENTION_DAYS = int(os.getenv("HISTORY_RETENTION_DAYS", 90))
 
 current_refresh_interval = REFRESH_INTERVAL
 
@@ -59,6 +66,74 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# sqlite3-соединения не шарятся между потоками (у нас Flask-потоки запросов +
+# отдельные threading.Timer для периодического refresh/fetch), поэтому проще
+# и безопаснее открывать короткое соединение на каждую операцию, а не держать
+# одно общее. Лок нужен, чтобы не ловить "database is locked" при параллельной
+# записи из cron-потоков и запроса одновременно.
+db_lock = threading.Lock()
+
+def init_db():
+    with db_lock, sqlite3.connect(DB_FILE) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sensor_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                data TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS token_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                event TEXT NOT NULL,
+                detail TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sensor_ts ON sensor_history(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_token_ts ON token_history(ts)")
+
+def log_sensor_snapshot(data):
+    ts = datetime.utcnow().isoformat()
+    try:
+        with db_lock, sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                "INSERT INTO sensor_history (ts, data) VALUES (?, ?)",
+                (ts, json.dumps(data)),
+            )
+    except Exception as e:
+        logger.error(f"Failed to log sensor snapshot: {e}")
+
+def log_token_event(event, detail=None):
+    ts = datetime.utcnow().isoformat()
+    try:
+        with db_lock, sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                "INSERT INTO token_history (ts, event, detail) VALUES (?, ?, ?)",
+                (ts, event, detail),
+            )
+    except Exception as e:
+        logger.error(f"Failed to log token event: {e}")
+
+def cleanup_old_history():
+    """Раз в сутки подчищаем записи старше HISTORY_RETENTION_DAYS, чтобы
+    файл базы не рос бесконечно на маленьком free-плане."""
+    try:
+        with db_lock, sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                "DELETE FROM sensor_history WHERE ts < datetime('now', ?)",
+                (f"-{HISTORY_RETENTION_DAYS} days",),
+            )
+            conn.execute(
+                "DELETE FROM token_history WHERE ts < datetime('now', ?)",
+                (f"-{HISTORY_RETENTION_DAYS} days",),
+            )
+    except Exception as e:
+        logger.error(f"Failed to clean up history: {e}")
+    t = threading.Timer(86400, cleanup_old_history)
+    t.daemon = True
+    t.start()
 
 sensors_data = {}
 status_info = {
@@ -117,6 +192,7 @@ def refresh_tokens():
         save_token(EVOLUTE_REFRESH_TOKEN_FILENAME, data["refreshToken"])
         update_status("last_token_update")
         tokens_ok = True
+        log_token_event("success")
 
         if current_refresh_interval != REFRESH_INTERVAL:
             logger.info(f"Token refresh successful. Resetting interval to {REFRESH_INTERVAL}s")
@@ -130,12 +206,15 @@ def refresh_tokens():
             new_interval = min(current_refresh_interval * 2, 3600)
             logger.warning(f"403 Forbidden during token refresh. Increasing cooldown from {current_refresh_interval}s to {new_interval}s")
             current_refresh_interval = new_interval
+            log_token_event("403", f"cooldown->{new_interval}s")
         else:
             logger.error(f"HTTP error refreshing tokens: {e}")
+            log_token_event("http_error", str(e))
 
     except Exception as e:
         tokens_ok = False
         logger.error(f"Failed to refresh tokens: {e}")
+        log_token_event("error", str(e))
 
 def fetch_sensor_data():
     global sensors_data
@@ -153,13 +232,29 @@ def fetch_sensor_data():
         }
         response = requests.get(EVOLUTE_SENSOR_URL, headers=headers, cookies=cookies, timeout=TIMEOUT)
         response.raise_for_status()
-        data = response.json()
+        raw = response.json()
+
         keys = JSON_SUB.strip(".").split(".")
+        data = raw
         for k in keys:
             data = data.get(k, {})
+
+        # JSON_SUB=".sensors" отбрасывает всё, кроме ветки sensors — а эти поля
+        # лежат в корне raw-ответа рядом с ней. Подмешиваем их как соседей
+        # sensorsData/positionData, чтобы забирать через уже существующий
+        # /sensors/<name> (isOnline, isParked, lastOnlineTime, prepRunning, prepAvailable)
+        # без отдельных новых эндпоинтов.
+        prep = raw.get("preparation_script") or {}
+        data["isOnline"] = raw.get("isOnline")
+        data["isParked"] = raw.get("isParked")
+        data["lastOnlineTime"] = raw.get("lastOnlineTime")
+        data["prepRunning"] = prep.get("running")
+        data["prepAvailable"] = prep.get("available")
+
         sensors_data = data
         update_status("last_sensor_update")
         write_json_file(DUMP_FILE, sensors_data)
+        log_sensor_snapshot(sensors_data)
         logger.info("Sensor data updated")
     except Exception as e:
         logger.error(f"Failed to fetch sensor data: {e}")
@@ -231,6 +326,48 @@ def set_tokens():
     current_refresh_interval = REFRESH_INTERVAL
 
     return jsonify({"status": "tokens updated"})
+
+@app.route("/history/sensors", methods=["GET"])
+def history_sensors():
+    check_auth(request)
+    try:
+        limit = min(int(request.args.get("limit", 100)), 1000)
+    except ValueError:
+        limit = 100
+    since = request.args.get("since")  # ISO-строка, опционально
+
+    query = "SELECT ts, data FROM sensor_history"
+    params = []
+    if since:
+        query += " WHERE ts >= ?"
+        params.append(since)
+    query += " ORDER BY ts DESC LIMIT ?"
+    params.append(limit)
+
+    with db_lock, sqlite3.connect(DB_FILE) as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    return jsonify([
+        {"ts": ts, "data": json.loads(data)} for ts, data in rows
+    ])
+
+@app.route("/history/tokens", methods=["GET"])
+def history_tokens():
+    check_auth(request)
+    try:
+        limit = min(int(request.args.get("limit", 100)), 1000)
+    except ValueError:
+        limit = 100
+
+    with db_lock, sqlite3.connect(DB_FILE) as conn:
+        rows = conn.execute(
+            "SELECT ts, event, detail FROM token_history ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    return jsonify([
+        {"ts": ts, "event": event, "detail": detail} for ts, event, detail in rows
+    ])
 
 @app.route("/manual_refresh", methods=["POST"])
 def manual_refresh():
@@ -409,6 +546,8 @@ if __name__ == "__main__":
     loaded_status = read_json_file(STATUS_FILE, default={})
     status_info.update({k: v for k, v in loaded_status.items() if k in status_info})
 
+    init_db()
+    cleanup_old_history()
     periodic_refresh()
     periodic_fetch()
 

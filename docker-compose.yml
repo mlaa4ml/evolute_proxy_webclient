@@ -11,3 +11,7 @@ services:
       CAR_ID: "SOME_CAR_ID_HASH_CHANGE_ME"
       API_KEY: "changeme"
       API_KEY_RW: "changeme_rw"
+      # Origin, с которого разрешены запросы к прокси.
+      # Для клиента, опубликованного на GitHub Pages:
+      # ALLOWED_ORIGIN: "https://<login>.github.io"
+      ALLOWED_ORIGIN: "*"

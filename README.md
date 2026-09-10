@@ -95,6 +95,7 @@
 | `JSON_SUB`     | Путь к данным сенсоров в JSON-ответе (по умолчанию `.sensors`).          |
 | `EVOLUTE_TOKEN_FILENAME` | Имя файла для сохранения токена доступа.                        |
 | `EVOLUTE_REFRESH_TOKEN_FILENAME` | Имя файла для сохранения токена обновления.                |
+| `ALLOWED_ORIGIN` | Origin, которому разрешён доступ к API из браузера (CORS). По умолчанию `*`. Для клиента на GitHub Pages укажи `https://<login>.github.io`. |
 
 
 > ⚠️⚠️⚠️ Приложение не запустится, если `CAR_ID` не задан или оставлен со значением по умолчанию (`SOME_CAR_ID_HASH_CHANGE_ME`).
@@ -145,6 +146,14 @@ nano set_token.sh
 ```bash
 bash set_token.sh
 ```
+
+### 🌐 Публикация веб-клиента на GitHub Pages
+
+Статический клиент `evolute_client.html` можно опубликовать на GitHub Pages
+одним workflow (`.github/workflows/pages.yml`), а Flask-прокси при этом
+держать на своём хосте — на Pages/Actions серверная часть работать не может.
+
+Подробная пошаговая инструкция: [docs/GITHUB_PAGES.md](docs/GITHUB_PAGES.md)
 
 ## Настройка Home assistant
 
