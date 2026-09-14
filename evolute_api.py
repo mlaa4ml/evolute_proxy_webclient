@@ -1,5 +1,7 @@
 import os
 import json
+import re
+import math
 import time
 import logging
 import threading
@@ -23,6 +25,30 @@ JSON_SUB = os.getenv("JSON_SUB", ".sensors")
 EVOLUTE_TOKEN_FILENAME = os.getenv("EVOLUTE_TOKEN_FILENAME", "evy-platform-access.txt")
 EVOLUTE_REFRESH_TOKEN_FILENAME = os.getenv("EVOLUTE_REFRESH_TOKEN_FILENAME", "evy-platform-refresh.txt")
 CAR_ID = os.getenv("CAR_ID", "SOME_CAR_ID_HASH_CHANGE_ME")
+
+# Telegram-уведомления администраторам. Если BOT_TOKEN не задан или список
+# админов пуст, алерты просто тихо отключаются (см. send_message).
+#
+# TELEGRAM_ADMIN_CHAT_ID — список получателей через запятую. У каждого можно
+# указать свой набор включённых типов алертов через двоеточие и "+":
+#   TELEGRAM_ADMIN_CHAT_ID=111111,222222:ignition+doors,333333:all
+# - 111111       — без фильтра, получает вообще все типы алертов
+# - 222222       — только "ignition" и "doors"
+# - 333333:all   — то же самое, что без фильтра (явно "все")
+# Доступные типы: movement, coords, ignition, connectivity, doors, battery_full
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_ADMIN_CHAT_ID = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+ALERT_TYPES = {"movement", "coords", "ignition", "connectivity", "doors", "battery_full"}
+
+# Порог значимого перемещения для алерта "coords", в метрах. Обычный бытовой
+# GPS-приёмник даёт погрешность порядка 5-15м (в городской застройке из-за
+# отражений сигнала — иногда 20-30м), поэтому сравнивать координаты "в лоб"
+# нельзя: стоящая на месте машина будет постоянно чуть "дрожать" в показаниях
+# и генерировать ложные срабатывания. Считаем координаты изменившимися только
+# если реальное расстояние между двумя снимками больше этого порога.
+COORDS_MIN_DISTANCE_METERS = float(os.getenv("COORDS_MIN_DISTANCE_METERS", 20))
 
 # По умолчанию — относительный путь (как раньше у токенов). На Railway задайте
 # DB_FILE=/data/evolute.db в Variables, чтобы файл жил в уже подключённом Volume
@@ -66,6 +92,164 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+
+def send_message(chat_id: int | str, text: str, **extra) -> dict:
+    """Отправить текстовое сообщение через Telegram Bot API. extra прокидывается
+    как есть (например parse_mode='HTML', reply_markup=...).
+    Никаких доп. библиотек не требуется — используем уже имеющийся requests,
+    как и для остальных HTTP-вызовов в этом файле.
+    Тихо ничего не делает, если TELEGRAM_BOT_TOKEN не сконфигурирован, и никогда
+    не бросает исключение наружу — чтобы сбой Telegram не ронял основной цикл
+    опроса сенсоров."""
+    if not TELEGRAM_BOT_TOKEN:
+        return {}
+    payload = {"chat_id": chat_id, "text": text, **extra}
+    try:
+        resp = requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.error(f"Failed to send Telegram message: {e}")
+        return {}
+
+
+def parse_admin_subscriptions(raw: str) -> dict:
+    """Разбирает TELEGRAM_ADMIN_CHAT_ID в {chat_id: set(алертов) | None}.
+    None означает "все типы алертов включены" (админ без фильтра или с ":all").
+    Некорректные/неизвестные типы алертов логируются и просто отбрасываются,
+    чтобы опечатка в конфиге не роняла сервис."""
+    subscriptions = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" in entry:
+            chat_id, filter_part = entry.split(":", 1)
+            chat_id = chat_id.strip()
+            filter_part = filter_part.strip()
+        else:
+            chat_id, filter_part = entry, ""
+        if not chat_id:
+            continue
+        if not filter_part or filter_part.lower() == "all":
+            subscriptions[chat_id] = None
+            continue
+        requested = {t.strip() for t in filter_part.split("+") if t.strip()}
+        unknown = requested - ALERT_TYPES
+        if unknown:
+            logger.warning(f"Admin {chat_id}: unknown alert types ignored: {sorted(unknown)}")
+        subscriptions[chat_id] = requested & ALERT_TYPES
+    return subscriptions
+
+
+ADMIN_SUBSCRIPTIONS = parse_admin_subscriptions(TELEGRAM_ADMIN_CHAT_ID)
+
+
+def notify_admins(alert_type: str, text: str, **extra):
+    """Рассылает сообщение всем администраторам, у которых включён данный
+    тип алерта (alert_type должен быть одним из ALERT_TYPES)."""
+    for chat_id, allowed in ADMIN_SUBSCRIPTIONS.items():
+        if allowed is None or alert_type in allowed:
+            send_message(chat_id, text, **extra)
+
+
+# Название сенсора двери/багажника -> подпись в уведомлении.
+DOOR_LABELS = {
+    "doorFLStatus": "Передняя левая дверь",
+    "doorFRStatus": "Передняя правая дверь",
+    "doorRLStatus": "Задняя левая дверь",
+    "doorRRStatus": "Задняя правая дверь",
+    "trunkStatus": "Багажник",
+}
+DOOR_LIKE_PATTERN = re.compile(r"^(door\w*status|trunkstatus)$", re.I)
+
+
+def haversine_meters(lat1, lon1, lat2, lon2) -> float:
+    """Расстояние между двумя точками на сфере (формула Хаверсина), в метрах.
+    Используется только math из стандартной библиотеки, без гео-пакетов."""
+    r = 6371000  # средний радиус Земли, м
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def check_sensor_alerts(old_data: dict, new_data: dict):
+    """Сравнивает предыдущий и новый снимок сенсоров и шлёт алерты
+    только на смене состояния (edge-triggered), а не при каждом опросе:
+      - movement      — скорость была 0/отсутствовала, стала > 0;
+      - coords        — координаты изменились относительно прошлого снимка;
+      - ignition      — зажигание включили/выключили;
+      - connectivity  — машина потеряла/восстановила связь (isOnline);
+      - doors         — дверь или багажник открылись, пока машина на стоянке;
+      - battery_full  — заряд батареи достиг 100% (во время самой зарядки,
+                         пока % ниже 100, ничего не шлём — только на финише).
+    На самом первом снимке после старта сервиса (old_data пуст) ничего не
+    шлём, чтобы не спамить при каждом рестарте."""
+    if not old_data:
+        return
+
+    old_pos = old_data.get("positionData") or {}
+    new_pos = new_data.get("positionData") or {}
+    old_sensors = old_data.get("sensorsData") or {}
+    new_sensors = new_data.get("sensorsData") or {}
+
+    # 1. Начало движения
+    old_speed = old_pos.get("speed")
+    new_speed = new_pos.get("speed")
+    if (old_speed in (0, None)) and isinstance(new_speed, (int, float)) and new_speed > 0:
+        notify_admins("movement", f"🚗 Автомобиль начал движение\nСкорость: {new_speed} км/ч")
+
+    # 2. Смена координат — только если реальное расстояние больше порога
+    #    COORDS_MIN_DISTANCE_METERS (см. объяснение у константы выше);
+    #    мелкий GPS-шум на стоянке молчит.
+    old_lat, old_lon = old_pos.get("lat"), old_pos.get("lon")
+    new_lat, new_lon = new_pos.get("lat"), new_pos.get("lon")
+    if old_lat is not None and old_lon is not None and new_lat is not None and new_lon is not None:
+        distance = haversine_meters(old_lat, old_lon, new_lat, new_lon)
+        if distance >= COORDS_MIN_DISTANCE_METERS:
+            notify_admins(
+                "coords",
+                f"📍 Координаты изменились (~{distance:.0f} м)\n"
+                f"Было: {old_lat}, {old_lon}\nСтало: {new_lat}, {new_lon}",
+            )
+
+    # 3. Зажигание вкл/выкл
+    old_ignition = old_sensors.get("ignitionStatus")
+    new_ignition = new_sensors.get("ignitionStatus")
+    if old_ignition is not None and new_ignition is not None and old_ignition != new_ignition:
+        if new_ignition:
+            notify_admins("ignition", "🔑 Зажигание включено")
+        else:
+            notify_admins("ignition", "🔑 Зажигание выключено")
+
+    # 4. Потеря/восстановление связи
+    old_online = old_data.get("isOnline")
+    new_online = new_data.get("isOnline")
+    if old_online is not None and new_online is not None and old_online != new_online:
+        if new_online:
+            notify_admins("connectivity", "✅ Связь с автомобилем восстановлена")
+        else:
+            notify_admins("connectivity", "⚠️ Потеряна связь с автомобилем")
+
+    # 5. Двери/багажник открылись на стоянке
+    if new_data.get("isParked"):
+        for key, new_val in new_sensors.items():
+            if not DOOR_LIKE_PATTERN.match(key):
+                continue
+            if old_sensors.get(key) == 0 and new_val == 1:
+                label = DOOR_LABELS.get(key, key)
+                notify_admins("doors", f"🚪 {label}: открыт(а) на стоянке")
+
+    # 6. Батарея зарядилась до 100% (ничего не шлём, пока идёт сама зарядка —
+    #    только в момент, когда % впервые достиг 100)
+    old_batt = old_sensors.get("batteryPercentage")
+    new_batt = new_sensors.get("batteryPercentage")
+    if isinstance(old_batt, (int, float)) and isinstance(new_batt, (int, float)) and old_batt < 100 <= new_batt:
+        notify_admins("battery_full", "🔋 Зарядка завершена: батарея заряжена на 100%")
+
 
 # sqlite3-соединения не шарятся между потоками (у нас Flask-потоки запросов +
 # отдельные threading.Timer для периодического refresh/fetch), поэтому проще
@@ -250,6 +434,11 @@ def fetch_sensor_data():
         data["lastOnlineTime"] = raw.get("lastOnlineTime")
         data["prepRunning"] = prep.get("running")
         data["prepAvailable"] = prep.get("available")
+
+        try:
+            check_sensor_alerts(sensors_data, data)
+        except Exception as e:
+            logger.error(f"Sensor alert check failed: {e}")
 
         sensors_data = data
         update_status("last_sensor_update")

@@ -6,6 +6,8 @@
 <title>Evolute · Пульт</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   :root{
     --bg:#12161b;
@@ -174,6 +176,26 @@
     margin-bottom:14px;
   }
   code{font-family:var(--mono);background:var(--panel-alt);padding:1px 4px;border-radius:3px;font-size:12px;}
+
+  .stat-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:12px;}
+  .stat-card{border:1px solid var(--border);border-radius:var(--radius);background:var(--panel-alt);padding:9px 10px;}
+  .stat-card .val{font-family:var(--mono);font-size:16px;color:var(--accent);}
+  .stat-card .lbl{font-size:11px;color:var(--text-dim);margin-top:2px;}
+
+  #routesMap{height:340px;border:1px solid var(--border);border-radius:var(--radius);margin-top:10px;background:var(--panel-alt);}
+  .leaflet-container{background:var(--panel-alt);font-family:var(--sans);}
+
+  table.data{width:100%;border-collapse:collapse;font-size:12.5px;}
+  table.data th{text-align:left;font-size:11px;color:var(--text-dim);font-weight:500;padding:4px 8px;border-bottom:1px solid var(--border);}
+  table.data td{padding:5px 8px;border-bottom:1px solid var(--border);font-family:var(--mono);}
+  table.data tr:last-child td{border-bottom:none;}
+  .badge{display:inline-block;padding:1px 6px;border-radius:999px;font-size:10.5px;font-family:var(--sans);}
+  .badge.full{background:rgba(89,195,168,.15);color:var(--accent);}
+  .badge.partial{background:rgba(224,164,88,.15);color:var(--warn);}
+
+  .chart-wrap{margin-top:10px;}
+  .chart-wrap svg{width:100%;height:120px;display:block;}
+  .chart-wrap .axis-label{font-size:10px;fill:var(--text-dim);font-family:var(--mono);}
 </style>
 </head>
 <body>
@@ -232,6 +254,8 @@
     <div>
       <nav class="tabs">
         <button data-tab="overview" class="active">Обзор</button>
+        <button data-tab="routes">Маршруты</button>
+        <button data-tab="charging">Зарядка</button>
         <button data-tab="actions">Действия</button>
         <button data-tab="explorer">Разведка</button>
         <button data-tab="history">История</button>
@@ -256,6 +280,38 @@
             <button id="getSingleSensor" style="flex:none;">Запросить</button>
           </div>
           <div id="singleSensorOut" style="margin-top:8px;"></div>
+        </div>
+      </div>
+
+      <div class="tabpane" id="tab-routes">
+        <div class="panel">
+          <div class="toolbar">
+            <h2 style="margin:0;">Маршруты за период</h2>
+            <div class="grow"></div>
+            <input id="routesLimit" value="500" style="width:70px;flex:none;" title="limit (макс. 1000 снимков истории)">
+            <input id="routesSince" placeholder="since (ISO, опц.)" style="width:180px;flex:none;">
+            <button id="loadRoutes">Загрузить</button>
+          </div>
+          <p class="hint">Строится из <code>/history/sensors</code>: снимок считается «в движении», если <code>positionData.speed</code> выше порога, а сегменты движения без разрыва дольше 20 минут склеиваются в одну поездку.</p>
+          <div class="stat-cards" id="routesStats"></div>
+          <div id="routesMap"></div>
+          <div id="routesOut" style="margin-top:10px;"><p class="empty">нет данных</p></div>
+        </div>
+      </div>
+
+      <div class="tabpane" id="tab-charging">
+        <div class="panel">
+          <div class="toolbar">
+            <h2 style="margin:0;">Сессии зарядки за период</h2>
+            <div class="grow"></div>
+            <input id="chargingLimit" value="500" style="width:70px;flex:none;" title="limit (макс. 1000 снимков истории)">
+            <input id="chargingSince" placeholder="since (ISO, опц.)" style="width:180px;flex:none;">
+            <button id="loadCharging">Загрузить</button>
+          </div>
+          <p class="hint">Сессией зарядки считается рост <code>sensorsData.batteryPercentage</code> пока машина на стоянке (<code>isParked</code>); рекуперация в движении не считается, короткие плато без падения % не разрывают сессию.</p>
+          <div class="stat-cards" id="chargingStats"></div>
+          <div class="chart-wrap" id="batteryChart"></div>
+          <div id="chargingOut" style="margin-top:10px;"><p class="empty">нет данных</p></div>
         </div>
       </div>
 
@@ -570,6 +626,295 @@ function renderHistoryRows(container, rows, isTokens){
   container.appendChild(table);
 }
 
+// ---- маршруты и зарядка (разбор /history/sensors на клиенте) ----
+
+let leafletMap = null;
+let leafletLayerGroup = null;
+
+function ensureMap(){
+  if(!leafletMap){
+    leafletMap = L.map("routesMap").setView([55.75, 37.61], 10);
+    // tile.openstreetmap.org - это бесплатный волонтёрский сервер с жёсткой
+    // политикой использования, не предназначенный для встраивания во
+    // внешние приложения (отсюда 403 Access blocked). CARTO basemaps -
+    // бесплатная альтернатива без ключа API, разрешённая именно для такого
+    // использования, с той же OSM-подложкой снизу.
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
+      maxZoom: 20,
+      subdomains: "abcd",
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    }).addTo(leafletMap);
+    leafletLayerGroup = L.layerGroup().addTo(leafletMap);
+  }
+  return leafletMap;
+}
+
+function fmtDuration(ms){
+  if(!ms || ms < 0) return "0м";
+  const totalMin = Math.round(ms / 60000);
+  const h = Math.floor(totalMin / 60), m = totalMin % 60;
+  return h ? `${h}ч ${m}м` : `${m}м`;
+}
+
+function fmtDt(d){
+  return d.toLocaleString("ru-RU", { day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit" });
+}
+
+function haversineKm(lat1, lon1, lat2, lon2){
+  const R = 6371, toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// /history/sensors отдаёт ORDER BY ts DESC — для построения маршрута/сессий
+// нужен хронологический порядок, разворачиваем.
+async function fetchHistoryAscending(limitId, sinceId, extraParams){
+  const limit = $(limitId).value.trim() || "500";
+  const since = sinceId ? $(sinceId).value.trim() : "";
+  let path = "/history/sensors?limit=" + encodeURIComponent(limit);
+  if(since) path += "&since=" + encodeURIComponent(since);
+  const rows = await call("GET", path);
+  return rows.slice().reverse();
+}
+
+function extractPoints(rows){
+  return rows.map(r => {
+    const pos = (r.data && r.data.positionData) || {};
+    const sens = (r.data && r.data.sensorsData) || {};
+    return {
+      ts: new Date(r.ts + "Z"),
+      lat: pos.lat, lon: pos.lon, speed: pos.speed,
+      battery: sens.batteryPercentage, odometer: sens.odometer,
+      ignition: sens.ignitionStatus,
+      isParked: r.data && r.data.isParked,
+    };
+  });
+}
+
+function buildTrips(points, { speedThreshold = 3, gapMinutes = 20 } = {}){
+  const pts = points.filter(p => typeof p.lat === "number" && typeof p.lon === "number");
+  const trips = [];
+  let current = null, prev = null;
+  for(const p of pts){
+    const moving = typeof p.speed === "number"
+      ? p.speed > speedThreshold
+      : !!(prev && (Math.abs(p.lat - prev.lat) > 0.0005 || Math.abs(p.lon - prev.lon) > 0.0005));
+    const gapTooLarge = prev && (p.ts - prev.ts) > gapMinutes * 60 * 1000;
+    if(moving){
+      if(!current || gapTooLarge){ current = { points: [] }; trips.push(current); }
+      current.points.push(p);
+    } else {
+      current = null;
+    }
+    prev = p;
+  }
+  return trips
+    .filter(t => t.points.length > 1)
+    .map(t => {
+      let dist = 0;
+      for(let i = 1; i < t.points.length; i++){
+        dist += haversineKm(t.points[i-1].lat, t.points[i-1].lon, t.points[i].lat, t.points[i].lon);
+      }
+      const start = t.points[0].ts, end = t.points[t.points.length-1].ts;
+      return { points: t.points, start, end, distanceKm: dist, durationMs: end - start };
+    });
+}
+
+function buildChargingSessions(points, { gapMinutes = 15 } = {}){
+  // Реальная зарядка возможна только пока машина запаркована (isParked===true) -
+  // это отсекает рекуперацию при торможении в движении, которая тоже поднимает
+  // batteryPercentage, но не является зарядкой на стоянке.
+  // Внутри "стояночного" периода сессия не разрывается на плато (% не изменился
+  // между соседними снимками - это нормально, т.к. % целочисленный, а снимки
+  // чаще, чем набор одного процента) - разрыв только при падении % или при
+  // паузе в данных длиннее gapMinutes (например, машина уехала и вернулась).
+  const pts = points.filter(p => typeof p.battery === "number" && p.isParked === true);
+  const sessions = [];
+  let current = null, prev = null;
+  for(const p of pts){
+    const gapTooLarge = prev && (p.ts - prev.ts) > gapMinutes * 60 * 1000;
+    const dropped = prev && p.battery < prev.battery;
+    if(prev && !gapTooLarge && !dropped){
+      if(!current){ current = { points: [prev] }; sessions.push(current); }
+      current.points.push(p);
+      // 100% - выше расти некуда, дальше это гарантированно уже не зарядка,
+      // а просто стоянка с полной батареей. Закрываем сессию сразу, не
+      // копим часы/дни плоских снимков в памяти.
+      if(p.battery >= 100){ current = null; }
+    } else {
+      current = null;
+    }
+    prev = p;
+  }
+  return sessions
+    .filter(s => s.points.length > 1 && s.points[s.points.length-1].battery > s.points[0].battery)
+    .map(s => {
+      // Внутри одной накопленной сессии % никогда не убывает (иначе сессия
+      // рвётся раньше на dropped) - значит s.points[0].battery это и есть
+      // минимум. "Старт" - последний снимок именно на этом минимуме, а не
+      // первый накопленный снимок: если машина простояла на одном % пару
+      // часов ДО того, как её воткнули заряжаться, вся эта простойная часть
+      // не должна попадать в сессию как её начало.
+      const minPct = s.points[0].battery;
+      let startIdx = 0;
+      while(startIdx + 1 < s.points.length && s.points[startIdx + 1].battery === minPct){
+        startIdx++;
+      }
+      const start = s.points[startIdx];
+      // "Финиш" сессии - момент, когда % ВПЕРВЫЕ достиг своего пика в рамках
+      // сессии, а не последний накопленный снимок. Иначе плато после
+      // окончания зарядки (машина просто стоит с тем же % часами) визуально
+      // "растягивает" сессию на всё это время, хотя зарядка давно закончилась.
+      const peakPct = Math.max(...s.points.map(p => p.battery));
+      const end = s.points.find(p => p.battery === peakPct);
+      return {
+        start: start.ts, end: end.ts, startPct: start.battery, endPct: end.battery,
+        durationMs: end.ts - start.ts,
+      };
+  });
+}
+
+function statCard(val, lbl){
+  return `<div class="stat-card"><div class="val">${escapeHtml(String(val))}</div><div class="lbl">${escapeHtml(lbl)}</div></div>`;
+}
+
+function renderRoutes(points, trips){
+  const stats = $("routesStats");
+  const totalDist = trips.reduce((s,t) => s + t.distanceKm, 0);
+  const totalTime = trips.reduce((s,t) => s + t.durationMs, 0);
+  stats.innerHTML = [
+    statCard(trips.length, "поездок"),
+    statCard(totalDist.toFixed(1) + " км", "пройдено всего"),
+    statCard(fmtDuration(totalTime), "суммарно в движении"),
+    statCard(points.length, "снимков в выборке"),
+  ].join("");
+
+  const map = ensureMap();
+  leafletLayerGroup.clearLayers();
+  const colors = ["#59c3a8", "#e0a458", "#d97066", "#7ea6d9", "#c58ee0"];
+  const allPts = points.filter(p => typeof p.lat === "number" && typeof p.lon === "number");
+
+  const out = $("routesOut");
+  if(!trips.length){
+    out.innerHTML = `<p class="empty">Движения в выбранном периоде не найдено — все точки координат совпадают, машина стояла на месте.</p>`;
+    if(allPts.length){
+      const last = allPts[allPts.length - 1];
+      L.marker([last.lat, last.lon]).addTo(leafletLayerGroup)
+        .bindPopup(`Единственная позиция<br>${fmtDt(last.ts)}`);
+      map.setView([last.lat, last.lon], 14);
+    }
+    setTimeout(() => map.invalidateSize(), 30);
+    return;
+  }
+
+  trips.forEach((t, i) => {
+    const color = colors[i % colors.length];
+    const latlngs = t.points.map(p => [p.lat, p.lon]);
+    L.polyline(latlngs, { color, weight: 4, opacity: 0.85 }).addTo(leafletLayerGroup);
+    L.circleMarker(latlngs[0], { color, radius: 5, fillOpacity: 1 }).addTo(leafletLayerGroup)
+      .bindPopup(`Старт поездки ${i+1}<br>${fmtDt(t.start)}`);
+    L.circleMarker(latlngs[latlngs.length-1], { color, radius: 5, fillOpacity: 1 }).addTo(leafletLayerGroup)
+      .bindPopup(`Финиш поездки ${i+1}<br>${fmtDt(t.end)}`);
+  });
+  const bounds = L.latLngBounds(trips.flatMap(t => t.points.map(p => [p.lat, p.lon])));
+  map.fitBounds(bounds, { padding: [24,24] });
+  setTimeout(() => map.invalidateSize(), 30);
+
+  const table = document.createElement("table");
+  table.className = "data";
+  table.innerHTML = `<tr><th>#</th><th>Старт</th><th>Финиш</th><th>В пути</th><th>Расстояние</th><th>Ср. скорость</th></tr>`;
+  trips.forEach((t, i) => {
+    const avgSpeed = t.durationMs > 0 ? (t.distanceKm / (t.durationMs / 3600000)) : 0;
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td style="color:${colors[i % colors.length]}">●</td><td>${fmtDt(t.start)}</td><td>${fmtDt(t.end)}</td>` +
+      `<td>${fmtDuration(t.durationMs)}</td><td>${t.distanceKm.toFixed(1)} км</td><td>${avgSpeed.toFixed(0)} км/ч</td>`;
+    table.appendChild(tr);
+  });
+  out.innerHTML = "";
+  out.appendChild(table);
+}
+
+function renderBatteryChart(points){
+  const wrap = $("batteryChart");
+  const pts = points.filter(p => typeof p.battery === "number");
+  if(pts.length < 2){ wrap.innerHTML = ""; return; }
+  const w = 900, h = 110, pad = 6;
+  const minT = pts[0].ts.getTime(), maxT = pts[pts.length-1].ts.getTime();
+  const spanT = Math.max(1, maxT - minT);
+  const minB = Math.min(...pts.map(p => p.battery), 0);
+  const maxB = Math.max(...pts.map(p => p.battery), 100);
+  const spanB = Math.max(1, maxB - minB);
+  const x = t => pad + (t - minT) / spanT * (w - 2*pad);
+  const y = b => h - pad - (b - minB) / spanB * (h - 2*pad);
+  const path = pts.map((p,i) => `${i===0 ? "M" : "L"}${x(p.ts.getTime()).toFixed(1)},${y(p.battery).toFixed(1)}`).join(" ");
+  wrap.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+    <path d="${path}" fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke"/>
+    <text class="axis-label" x="${pad}" y="${h-2}">${escapeHtml(fmtDt(pts[0].ts))}</text>
+    <text class="axis-label" x="${w-pad}" y="${h-2}" text-anchor="end">${escapeHtml(fmtDt(pts[pts.length-1].ts))}</text>
+    <text class="axis-label" x="${pad}" y="10">${maxB}%</text>
+    <text class="axis-label" x="${pad}" y="${h-pad-2}">${minB}%</text>
+  </svg>`;
+}
+
+function renderCharging(points, sessions){
+  const stats = $("chargingStats");
+  const fullCount = sessions.filter(s => s.endPct >= 100).length;
+  const totalAdded = sessions.reduce((s, ses) => s + (ses.endPct - ses.startPct), 0);
+  stats.innerHTML = [
+    statCard(sessions.length, "сессий зарядки"),
+    statCard(fullCount, "до 100%"),
+    statCard(totalAdded.toFixed(0) + "%", "суммарно заряжено"),
+    statCard(points.length, "снимков в выборке"),
+  ].join("");
+
+  renderBatteryChart(points);
+
+  const out = $("chargingOut");
+  if(!sessions.length){
+    out.innerHTML = `<p class="empty">Роста заряда в выбранном периоде не найдено — % заряда не увеличивался ни на одном соседнем снимке.</p>`;
+    return;
+  }
+  const table = document.createElement("table");
+  table.className = "data";
+  table.innerHTML = `<tr><th>Старт</th><th>Финиш</th><th>Заряд</th><th>Длительность</th><th>Скорость заряда</th><th></th></tr>`;
+  sessions.forEach(s => {
+    const pctGain = s.endPct - s.startPct;
+    const ratePerHour = s.durationMs > 0 ? pctGain / (s.durationMs / 3600000) : 0;
+    const full = s.endPct >= 100;
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${fmtDt(s.start)}</td><td>${fmtDt(s.end)}</td>` +
+      `<td>${s.startPct}% → ${s.endPct}%</td><td>${fmtDuration(s.durationMs)}</td>` +
+      `<td>${ratePerHour.toFixed(1)}%/ч</td>` +
+      `<td><span class="badge ${full ? "full" : "partial"}">${full ? "до 100%" : "не завершена"}</span></td>`;
+    table.appendChild(tr);
+  });
+  out.innerHTML = "";
+  out.appendChild(table);
+}
+
+$("loadRoutes").onclick = async () => {
+  try{
+    const rows = await fetchHistoryAscending("routesLimit", "routesSince");
+    const points = extractPoints(rows);
+    const trips = buildTrips(points);
+    renderRoutes(points, trips);
+  }catch(e){
+    $("routesOut").innerHTML = `<p class="empty">нет данных / ошибка</p>`;
+  }
+};
+
+$("loadCharging").onclick = async () => {
+  try{
+    const rows = await fetchHistoryAscending("chargingLimit", "chargingSince");
+    const points = extractPoints(rows);
+    const sessions = buildChargingSessions(points);
+    renderCharging(points, sessions);
+  }catch(e){
+    $("chargingOut").innerHTML = `<p class="empty">нет данных / ошибка</p>`;
+  }
+};
+
 // ---- wiring ----
 
 $("saveConn").onclick = async () => { await persistConn(); alert("Сохранено."); };
@@ -726,6 +1071,7 @@ document.querySelectorAll("nav.tabs button").forEach(btn => {
     document.querySelectorAll(".tabpane").forEach(p => p.classList.remove("active"));
     btn.classList.add("active");
     $("tab-" + btn.dataset.tab).classList.add("active");
+    if(btn.dataset.tab === "routes"){ setTimeout(() => ensureMap().invalidateSize(), 30); }
   };
 });
 
