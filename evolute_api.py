@@ -293,9 +293,15 @@ def haversine_meters(lat1, lon1, lat2, lon2) -> float:
 # отдельный lock не нужен.
 current_trip = None  # dict | None
 
+# Уже отправляли "автомобиль начал движение" в рамках текущей поездки
+# (с момента включения зажигания). Сбрасывается при старте/завершении
+# поездки, чтобы остановки на светофоре (скорость 0 -> >0 -> 0 -> ...)
+# не спамили этим алертом повторно, пока зажигание не выключили.
+movement_notified_this_trip = False
+
 
 def _start_trip(ts: str, pos: dict, sensors: dict):
-    global current_trip
+    global current_trip, movement_notified_this_trip
     current_trip = {
         "start_ts": ts,
         "start_lat": pos.get("lat"),
@@ -306,13 +312,15 @@ def _start_trip(ts: str, pos: dict, sensors: dict):
         "distance_m": 0.0,
         "points": 0,
     }
+    movement_notified_this_trip = False
 
 
 def _finish_trip(ts: str, pos: dict, sensors: dict):
     """Закрывает текущую поездку и шлёт сводку "coords_summary"-подписчикам.
     Ничего не делает, если поездки не было (например рестарт сервиса
     случился уже после выключения зажигания)."""
-    global current_trip
+    global current_trip, movement_notified_this_trip
+    movement_notified_this_trip = False
     if current_trip is None:
         return
     trip = current_trip
@@ -382,11 +390,20 @@ def check_sensor_alerts(old_data: dict, new_data: dict):
     new_sensors = new_data.get("sensorsData") or {}
     snapshot_ts = datetime.utcnow().isoformat()
 
-    # 1. Начало движения
+    # 1. Начало движения — только первый раз за поездку (см. movement_notified_this_trip
+    #    выше): иначе каждая остановка на светофоре/в пробке (скорость падает
+    #    до 0, потом снова растёт) заново триггерит этот алерт.
+    global movement_notified_this_trip
     old_speed = old_pos.get("speed")
     new_speed = new_pos.get("speed")
-    if (old_speed in (0, None)) and isinstance(new_speed, (int, float)) and new_speed > 0:
+    if (
+        (old_speed in (0, None))
+        and isinstance(new_speed, (int, float))
+        and new_speed > 0
+        and not movement_notified_this_trip
+    ):
         notify_admins("movement", f"🚗 Автомобиль начал движение\nСкорость: {new_speed} км/ч")
+        movement_notified_this_trip = True
 
     # 2. Смена координат — только если реальное расстояние больше порога
     #    COORDS_MIN_DISTANCE_METERS (см. объяснение у константы выше);
@@ -402,9 +419,13 @@ def check_sensor_alerts(old_data: dict, new_data: dict):
     if old_lat is not None and old_lon is not None and new_lat is not None and new_lon is not None:
         distance = haversine_meters(old_lat, old_lon, new_lat, new_lon)
         if distance >= COORDS_MIN_DISTANCE_METERS:
+            map_url = (
+                f"https://yandex.ru/maps/?rtext={old_lat},{old_lon}~{new_lat},{new_lon}&rtt=auto"
+            )
             text = (
-                f"📍 Координаты изменились (~{distance:.0f} м)\n"
-                f"Было: {old_lat}, {old_lon}\nСтало: {new_lat}, {new_lon}"
+                f"📍 Координаты изменились (~{distance:.0f} м по прямой)\n"
+                f"Было: {old_lat}, {old_lon}\nСтало: {new_lat}, {new_lon}\n\n"
+                f"{map_url}"
             )
             if driving:
                 notify_admins("coords", text)
