@@ -7,9 +7,12 @@ import logging
 import threading
 import sqlite3
 import sys
+import gzip
+import tempfile
+import shutil
 import requests
 from flask import Flask, request, jsonify, abort
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Response
 from urllib.parse import urljoin
 
@@ -21,6 +24,25 @@ API_KEY_RW = os.getenv("API_KEY_RW", "change_me_rw")
 TIMEOUT = int(os.getenv("TIMEOUT", 60))
 REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", 600))
 SENSORS_REFRESH_INTERVAL = int(os.getenv("SENSORS_REFRESH_INTERVAL", 120))
+# Пока машина едет (зажигание включено ИЛИ скорость > 0 — второе условие
+# ловит нештатное перемещение с выключенным зажиганием, например эвакуатор)
+# опрашиваем чаще, чем на стоянке — это даёт заметно более точный маршрут
+# и скорость, а не крупные "хорды" между редкими точками. На стоянке
+# возвращаемся к медленному интервалу, чтобы не плодить лишние записи в БД
+# и не грузить API машины без необходимости.
+SENSORS_REFRESH_INTERVAL_DRIVING = int(os.getenv("SENSORS_REFRESH_INTERVAL_DRIVING", 20))
+# Едем своим ходом или тащат на эвакуаторе — определяем как "движение"
+# (зажигание включено ИЛИ скорость > 0). Но переключаться на медленный
+# интервал СРАЗУ по первому же "стоим" нельзя — иначе пробка (в том числе
+# когда сам эвакуатор стоит в пробке, а у машины при этом зажигание
+# выключено) на минуту-две даст ложное "приехали, встали на стоянку",
+# опрос уйдёт на 2 минуты, и можно прозевать момент, когда затор
+# рассосался и движение возобновилось. Поэтому держим быстрый интервал ещё
+# SENSORS_REFRESH_COOLDOWN_SECONDS после последнего момента, когда
+# движение реально фиксировалось — и только если тишина продержалась
+# дольше этого окна, считаем что действительно встали и остыли до
+# медленного интервала.
+SENSORS_REFRESH_COOLDOWN_SECONDS = int(os.getenv("SENSORS_REFRESH_COOLDOWN_SECONDS", 180))
 JSON_SUB = os.getenv("JSON_SUB", ".sensors")
 EVOLUTE_TOKEN_FILENAME = os.getenv("EVOLUTE_TOKEN_FILENAME", "evy-platform-access.txt")
 EVOLUTE_REFRESH_TOKEN_FILENAME = os.getenv("EVOLUTE_REFRESH_TOKEN_FILENAME", "evy-platform-refresh.txt")
@@ -35,12 +57,31 @@ CAR_ID = os.getenv("CAR_ID", "SOME_CAR_ID_HASH_CHANGE_ME")
 # - 111111       — без фильтра, получает вообще все типы алертов
 # - 222222       — только "ignition" и "doors"
 # - 333333:all   — то же самое, что без фильтра (явно "все")
-# Доступные типы: movement, coords, ignition, connectivity, doors, battery_full
+# Доступные типы: movement, coords, coords_summary, ignition, connectivity,
+# doors, battery_full
+#
+# coords / coords_summary — это два взаимоисключающих режима получения
+# координат ИМЕННО во время поездки (зажигание включено):
+#   - "coords"         — как раньше: сообщение на каждое значимое смещение
+#                         GPS (может быть десятки сообщений за одну поездку)
+#   - "coords_summary" — вместо потока сообщений одна сводка по итогам
+#                         поездки (дистанция, длительность, старт/финиш),
+#                         отправляется в момент выключения зажигания
+# Если перемещение происходит ПРИ ВЫКЛЮЧЕННОМ зажигании (например машину
+# везёт эвакуатор) — это считается нештатной ситуацией, и координаты в этом
+# случае шлются как раньше, по каждому смещению, ОБОИМ типам подписчиков
+# ("coords" и "coords_summary" одинаково получают полный поток) — сжатие
+# применяется только к обычной поездке своим ходом.
+# Если у админа указаны оба типа сразу — побеждает "coords" (полный поток),
+# "coords_summary" в этом случае просто не имеет эффекта.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ADMIN_CHAT_ID = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-ALERT_TYPES = {"movement", "coords", "ignition", "connectivity", "doors", "battery_full"}
+ALERT_TYPES = {
+    "movement", "coords", "coords_summary", "ignition",
+    "connectivity", "doors", "battery_full",
+}
 
 # Порог значимого перемещения для алерта "coords", в метрах. Обычный бытовой
 # GPS-приёмник даёт погрешность порядка 5-15м (в городской застройке из-за
@@ -54,9 +95,27 @@ COORDS_MIN_DISTANCE_METERS = float(os.getenv("COORDS_MIN_DISTANCE_METERS", 20))
 # DB_FILE=/data/evolute.db в Variables, чтобы файл жил в уже подключённом Volume
 # и переживал редеплои, как и токены.
 DB_FILE = os.getenv("DB_FILE", "evolute_history.db")
+
+# HISTORY_RETENTION_DAYS — абсолютная страховочная граница: записи старше
+# этого возраста удаляются в любом случае, даже если архивация в Telegram
+# ниже выключена или у неё что-то не получилось. Не главный механизм чистки.
 HISTORY_RETENTION_DAYS = int(os.getenv("HISTORY_RETENTION_DAYS", 90))
 
+# --- Архивация истории в Telegram --------------------------------------
+# Раз в ARCHIVE_INTERVAL_DAYS суток: всё старше ARCHIVE_KEEP_DAYS выгружается
+# из sensor_history/token_history в сжатые .jsonl.gz (порезанные под лимит
+# файла бота — 50МБ, с запасом ARCHIVE_CHUNK_MAX_BYTES), отправляется в чат
+# TELEGRAM_ARCHIVE_CHAT_ID, и ТОЛЬКО после успешной отправки всех частей эти
+# строки удаляются из рабочей БД. Если TELEGRAM_ARCHIVE_CHAT_ID не задан,
+# архивация просто выключена — работает только страховочная чистка выше.
+TELEGRAM_ARCHIVE_CHAT_ID = os.getenv("TELEGRAM_ARCHIVE_CHAT_ID", "")
+ARCHIVE_INTERVAL_DAYS = float(os.getenv("ARCHIVE_INTERVAL_DAYS", 2))
+ARCHIVE_KEEP_DAYS = float(os.getenv("ARCHIVE_KEEP_DAYS", 3))
+ARCHIVE_CHUNK_MAX_BYTES = int(os.getenv("ARCHIVE_CHUNK_MAX_BYTES", 45 * 1024 * 1024))
+
 current_refresh_interval = REFRESH_INTERVAL
+current_sensor_interval = SENSORS_REFRESH_INTERVAL
+last_moving_ts = None  # time.time() последнего снимка, где moving было True
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -114,6 +173,37 @@ def send_message(chat_id: int | str, text: str, **extra) -> dict:
         return {}
 
 
+def send_document(chat_id: int | str, filepath: str, caption: str | None = None) -> dict | None:
+    """Отправить файл через Telegram Bot API (sendDocument, multipart/form-data).
+    Возвращает распарсенный JSON-ответ при успехе, иначе None — вызывающий код
+    ориентируется на None, чтобы понять "отправка не удалась, старые данные
+    из БД удалять нельзя". На файлы бот-API пока ограничивает загрузку 50МБ
+    (см. https://core.telegram.org/bots/api#senddocument), поэтому чанки
+    архива должны быть заведомо меньше этого лимита."""
+    if not TELEGRAM_BOT_TOKEN or not chat_id:
+        return None
+    try:
+        with open(filepath, "rb") as f:
+            data = {"chat_id": chat_id}
+            if caption:
+                data["caption"] = caption
+            resp = requests.post(
+                f"{TELEGRAM_API_URL}/sendDocument",
+                data=data,
+                files={"document": (os.path.basename(filepath), f)},
+                timeout=120,
+            )
+        resp.raise_for_status()
+        result = resp.json()
+        if not result.get("ok"):
+            logger.error(f"Telegram sendDocument returned not-ok: {result}")
+            return None
+        return result
+    except Exception as e:
+        logger.error(f"Failed to send document '{filepath}' to Telegram: {e}")
+        return None
+
+
 def parse_admin_subscriptions(raw: str) -> dict:
     """Разбирает TELEGRAM_ADMIN_CHAT_ID в {chat_id: set(алертов) | None}.
     None означает "все типы алертов включены" (админ без фильтра или с ":all").
@@ -154,6 +244,27 @@ def notify_admins(alert_type: str, text: str, **extra):
             send_message(chat_id, text, **extra)
 
 
+def notify_admins_any(alert_types: set, text: str, **extra):
+    """Как notify_admins, но админ получает сообщение, если у него включён
+    ХОТЯ БЫ ОДИН тип из alert_types. Нужно для координат при движении с
+    выключенным зажиганием (эвакуатор и т.п.) — там полный поток координат
+    шлётся и "coords", и "coords_summary" подписчикам одинаково, разница
+    режимов применяется только к обычной поездке (см. комментарий у
+    TELEGRAM_ADMIN_CHAT_ID)."""
+    for chat_id, allowed in ADMIN_SUBSCRIPTIONS.items():
+        if allowed is None or (allowed & alert_types):
+            send_message(chat_id, text, **extra)
+
+
+def notify_admins_coords_summary_only(text: str, **extra):
+    """Шлёт итоговую сводку по поездке только тем, кто явно выбрал
+    "coords_summary" и НЕ выбрал "coords" — те, кто и так получал полный
+    поток координат в реальном времени, повторную сводку не получают."""
+    for chat_id, allowed in ADMIN_SUBSCRIPTIONS.items():
+        if allowed is not None and "coords_summary" in allowed and "coords" not in allowed:
+            send_message(chat_id, text, **extra)
+
+
 # Название сенсора двери/багажника -> подпись в уведомлении.
 DOOR_LABELS = {
     "doorFLStatus": "Передняя левая дверь",
@@ -176,25 +287,100 @@ def haversine_meters(lat1, lon1, lat2, lon2) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
+# Состояние текущей поездки (зажигание включено), нужно только для
+# "coords_summary" — копится дистанция/точки, пока не выключится зажигание.
+# Обновляется исключительно из periodic_fetch (один поток таймера), поэтому
+# отдельный lock не нужен.
+current_trip = None  # dict | None
+
+
+def _start_trip(ts: str, pos: dict, sensors: dict):
+    global current_trip
+    current_trip = {
+        "start_ts": ts,
+        "start_lat": pos.get("lat"),
+        "start_lon": pos.get("lon"),
+        "start_odometer": sensors.get("odometer"),
+        "last_lat": pos.get("lat"),
+        "last_lon": pos.get("lon"),
+        "distance_m": 0.0,
+        "points": 0,
+    }
+
+
+def _finish_trip(ts: str, pos: dict, sensors: dict):
+    """Закрывает текущую поездку и шлёт сводку "coords_summary"-подписчикам.
+    Ничего не делает, если поездки не было (например рестарт сервиса
+    случился уже после выключения зажигания)."""
+    global current_trip
+    if current_trip is None:
+        return
+    trip = current_trip
+    current_trip = None
+
+    try:
+        start_dt = datetime.fromisoformat(trip["start_ts"])
+        end_dt = datetime.fromisoformat(ts)
+        duration_min = (end_dt - start_dt).total_seconds() / 60
+    except (ValueError, TypeError):
+        duration_min = None
+
+    end_odometer = sensors.get("odometer")
+    start_odometer = trip.get("start_odometer")
+    distance_km = None
+    if isinstance(start_odometer, (int, float)) and isinstance(end_odometer, (int, float)) \
+            and end_odometer >= start_odometer:
+        # одометр надёжнее суммы GPS-прыжков (не режет повороты по хорде)
+        distance_km = end_odometer - start_odometer
+    elif trip["distance_m"] > 0:
+        distance_km = trip["distance_m"] / 1000
+
+    lines = ["🏁 Поездка завершена"]
+    if duration_min is not None:
+        lines.append(f"Длительность: {duration_min:.0f} мин")
+    if distance_km is not None:
+        lines.append(f"Дистанция: {distance_km:.1f} км")
+    lines.append(f"Точек GPS: {trip['points']}")
+    if trip["start_lat"] is not None and trip["start_lon"] is not None:
+        lines.append(f"Старт: {trip['start_lat']}, {trip['start_lon']}")
+    end_lat, end_lon = pos.get("lat"), pos.get("lon")
+    if end_lat is not None and end_lon is not None:
+        lines.append(f"Финиш: {end_lat}, {end_lon}")
+
+    notify_admins_coords_summary_only("\n".join(lines))
+
+
 def check_sensor_alerts(old_data: dict, new_data: dict):
     """Сравнивает предыдущий и новый снимок сенсоров и шлёт алерты
     только на смене состояния (edge-triggered), а не при каждом опросе:
-      - movement      — скорость была 0/отсутствовала, стала > 0;
-      - coords        — координаты изменились относительно прошлого снимка;
-      - ignition      — зажигание включили/выключили;
-      - connectivity  — машина потеряла/восстановила связь (isOnline);
-      - doors         — дверь или багажник открылись, пока машина на стоянке;
-      - battery_full  — заряд батареи достиг 100% (во время самой зарядки,
-                         пока % ниже 100, ничего не шлём — только на финише).
-    На самом первом снимке после старта сервиса (old_data пуст) ничего не
-    шлём, чтобы не спамить при каждом рестарте."""
+      - movement       — скорость была 0/отсутствовала, стала > 0;
+      - coords         — координаты изменились относительно прошлого снимка;
+      - coords_summary — то же самое, но сжато: одна сводка по итогам
+                          поездки вместо потока сообщений (см. комментарий у
+                          TELEGRAM_ADMIN_CHAT_ID выше). Действует только
+                          пока включено зажигание — при движении на
+                          заглушенной машине (эвакуатор и т.п.) координаты
+                          всё равно шлются сразу, без сжатия;
+      - ignition       — зажигание включили/выключили;
+      - connectivity   — машина потеряла/восстановила связь (isOnline);
+      - doors          — дверь или багажник открылись, пока машина на стоянке;
+      - battery_full   — заряд батареи достиг 100% (во время самой зарядки,
+                          пока % ниже 100, ничего не шлём — только на финише).
+    На самом первом снимке после старта сервиса (old_data пуст) уведомления
+    не шлём, чтобы не спамить при каждом рестарте — но если сервис
+    перезапустился прямо посреди поездки (зажигание уже включено),
+    состояние поездки для coords_summary всё равно тихо инициализируем."""
     if not old_data:
+        new_sensors = new_data.get("sensorsData") or {}
+        if new_sensors.get("ignitionStatus") and current_trip is None:
+            _start_trip(datetime.utcnow().isoformat(), new_data.get("positionData") or {}, new_sensors)
         return
 
     old_pos = old_data.get("positionData") or {}
     new_pos = new_data.get("positionData") or {}
     old_sensors = old_data.get("sensorsData") or {}
     new_sensors = new_data.get("sensorsData") or {}
+    snapshot_ts = datetime.utcnow().isoformat()
 
     # 1. Начало движения
     old_speed = old_pos.get("speed")
@@ -205,16 +391,29 @@ def check_sensor_alerts(old_data: dict, new_data: dict):
     # 2. Смена координат — только если реальное расстояние больше порога
     #    COORDS_MIN_DISTANCE_METERS (см. объяснение у константы выше);
     #    мелкий GPS-шум на стоянке молчит.
+    # Едем своим ходом (зажигание сейчас включено) -> "coords" получает
+    # немедленное сообщение как раньше, "coords_summary" копит дистанцию и
+    # получит одну сводку в конце поездки. Едем/тащат с выключенным
+    # зажиганием (эвакуатор) -> оба типа получают полный поток немедленно,
+    # это нештатная ситуация, тут сжимать нечего.
     old_lat, old_lon = old_pos.get("lat"), old_pos.get("lon")
     new_lat, new_lon = new_pos.get("lat"), new_pos.get("lon")
+    driving = bool(new_sensors.get("ignitionStatus"))
     if old_lat is not None and old_lon is not None and new_lat is not None and new_lon is not None:
         distance = haversine_meters(old_lat, old_lon, new_lat, new_lon)
         if distance >= COORDS_MIN_DISTANCE_METERS:
-            notify_admins(
-                "coords",
+            text = (
                 f"📍 Координаты изменились (~{distance:.0f} м)\n"
-                f"Было: {old_lat}, {old_lon}\nСтало: {new_lat}, {new_lon}",
+                f"Было: {old_lat}, {old_lon}\nСтало: {new_lat}, {new_lon}"
             )
+            if driving:
+                notify_admins("coords", text)
+                if current_trip is not None:
+                    current_trip["distance_m"] += distance
+                    current_trip["last_lat"], current_trip["last_lon"] = new_lat, new_lon
+                    current_trip["points"] += 1
+            else:
+                notify_admins_any({"coords", "coords_summary"}, text)
 
     # 3. Зажигание вкл/выкл
     old_ignition = old_sensors.get("ignitionStatus")
@@ -222,8 +421,10 @@ def check_sensor_alerts(old_data: dict, new_data: dict):
     if old_ignition is not None and new_ignition is not None and old_ignition != new_ignition:
         if new_ignition:
             notify_admins("ignition", "🔑 Зажигание включено")
+            _start_trip(snapshot_ts, new_pos, new_sensors)
         else:
             notify_admins("ignition", "🔑 Зажигание выключено")
+            _finish_trip(snapshot_ts, new_pos, new_sensors)
 
     # 4. Потеря/восстановление связи
     old_online = old_data.get("isOnline")
@@ -260,6 +461,20 @@ db_lock = threading.Lock()
 
 def init_db():
     with db_lock, sqlite3.connect(DB_FILE) as conn:
+        # ВАЖНО: сам по себе DELETE в SQLite не уменьшает размер файла на
+        # диске — освободившиеся страницы просто попадают в внутренний
+        # freelist и переиспользуются под будущие INSERT, но файл не
+        # усыхает. Чтобы место реально возвращалось ОС (а не только
+        # переиспользовалось), включаем incremental auto_vacuum и после
+        # каждой чистки дёргаем PRAGMA incremental_vacuum (см. ниже).
+        # Режим применяется только к пустой БД или требует разового полного
+        # VACUUM для уже существующей — поэтому проверяем текущий режим и
+        # конвертируем один раз, если нужно (безопасно дергать при каждом
+        # старте, VACUUM на уже сконвертированной БД просто skip'нется).
+        cur_mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+        if cur_mode != 2:  # 2 = INCREMENTAL
+            conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
+            conn.execute("VACUUM")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sensor_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -300,9 +515,105 @@ def log_token_event(event, detail=None):
     except Exception as e:
         logger.error(f"Failed to log token event: {e}")
 
-def cleanup_old_history():
-    """Раз в сутки подчищаем записи старше HISTORY_RETENTION_DAYS, чтобы
-    файл базы не рос бесконечно на маленьком free-плане."""
+def _rows_to_jsonl_gz(rows: list, columns: list[str], path: str) -> int:
+    """Пишет rows как JSON-lines (по объекту в строке) сразу в gzip-файл.
+    Возвращает итоговый размер файла в байтах."""
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(dict(zip(columns, row)), ensure_ascii=False) + "\n")
+    return os.path.getsize(path)
+
+
+def _split_rows_to_gzip_chunks(rows: list, columns: list[str], tmp_dir: str, prefix: str) -> list[str]:
+    """Делит rows на .jsonl.gz файлы, каждый из которых гарантированно не
+    больше ARCHIVE_CHUNK_MAX_BYTES. Рекурсивно делит пополам, пока чанк не
+    влезет — это не самый быстрый способ (файл может пересобираться
+    несколько раз), зато не зависит от угадывания коэффициента сжатия:
+    сколько бы JSON ни весил и как бы хорошо/плохо ни сжимался конкретный
+    кусок истории, на выходе гарантированно получаем файлы под лимит."""
+    chunks = []
+
+    def _recurse(sub_rows, name):
+        path = os.path.join(tmp_dir, f"{name}.jsonl.gz")
+        size = _rows_to_jsonl_gz(sub_rows, columns, path)
+        if size <= ARCHIVE_CHUNK_MAX_BYTES or len(sub_rows) <= 1:
+            chunks.append(path)
+            return
+        os.remove(path)
+        mid = len(sub_rows) // 2
+        _recurse(sub_rows[:mid], name + "a")
+        _recurse(sub_rows[mid:], name + "b")
+
+    if rows:
+        _recurse(rows, prefix)
+    return chunks
+
+
+def archive_and_cleanup_history():
+    """Каждые ARCHIVE_INTERVAL_DAYS суток:
+    1) выгружает из sensor_history/token_history всё старше ARCHIVE_KEEP_DAYS
+       в сжатые .jsonl.gz (порезанные под лимит файла бота Telegram);
+    2) отправляет получившиеся части в TELEGRAM_ARCHIVE_CHAT_ID;
+    3) ТОЛЬКО если ВСЕ части успешно отправлены — удаляет эти строки из
+       рабочей БД и возвращает освободившееся место на диск через
+       incremental_vacuum. Если отправка чего-то не удалась — ничего не
+       удаляется, попробуем снова при следующем запуске.
+    Если TELEGRAM_ARCHIVE_CHAT_ID не задан, шаги 1-3 просто пропускаются.
+    В любом случае в конце выполняется старая страховочная чистка по
+    HISTORY_RETENTION_DAYS, чтобы БД не росла бесконечно, даже если
+    архивация выключена или постоянно падает."""
+    if TELEGRAM_ARCHIVE_CHAT_ID:
+        cutoff = (datetime.utcnow() - timedelta(days=ARCHIVE_KEEP_DAYS)).isoformat()
+        tmp_dir = tempfile.mkdtemp(prefix="evolute_archive_")
+        try:
+            with db_lock, sqlite3.connect(DB_FILE) as conn:
+                sensor_rows = conn.execute(
+                    "SELECT id, ts, data FROM sensor_history WHERE ts < ? ORDER BY ts",
+                    (cutoff,),
+                ).fetchall()
+                token_rows = conn.execute(
+                    "SELECT id, ts, event, detail FROM token_history WHERE ts < ? ORDER BY ts",
+                    (cutoff,),
+                ).fetchall()
+
+            if sensor_rows or token_rows:
+                date_tag = datetime.utcnow().strftime("%Y%m%d_%H%M")
+                chunks = _split_rows_to_gzip_chunks(
+                    sensor_rows, ["id", "ts", "data"], tmp_dir, f"sensor_history_{date_tag}"
+                ) + _split_rows_to_gzip_chunks(
+                    token_rows, ["id", "ts", "event", "detail"], tmp_dir, f"token_history_{date_tag}"
+                )
+
+                all_ok = True
+                for i, path in enumerate(chunks, 1):
+                    caption = f"evolute архив {date_tag}: {os.path.basename(path)} ({i}/{len(chunks)})"
+                    if send_document(TELEGRAM_ARCHIVE_CHAT_ID, path, caption) is None:
+                        all_ok = False
+                        logger.error(f"Archive chunk send failed on {path}, aborting this run")
+                        break
+                    # небольшая пауза между сообщениями, чтобы не словить
+                    # flood control одного чата в Telegram
+                    time.sleep(2)
+
+                if all_ok:
+                    with db_lock, sqlite3.connect(DB_FILE) as conn:
+                        conn.execute("DELETE FROM sensor_history WHERE ts < ?", (cutoff,))
+                        conn.execute("DELETE FROM token_history WHERE ts < ?", (cutoff,))
+                        conn.execute("PRAGMA incremental_vacuum")
+                    logger.info(
+                        f"Archived & purged {len(sensor_rows)} sensor_history + "
+                        f"{len(token_rows)} token_history rows older than {cutoff}"
+                    )
+                else:
+                    logger.error("Archive run incomplete — old rows kept in DB, will retry next run")
+        except Exception as e:
+            logger.error(f"Archive job failed: {e}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # Страховочная чистка (старое поведение) — работает независимо от
+    # архивации, чтобы совсем старые данные не копились бесконечно ни при
+    # каких обстоятельствах.
     try:
         with db_lock, sqlite3.connect(DB_FILE) as conn:
             conn.execute(
@@ -313,9 +624,11 @@ def cleanup_old_history():
                 "DELETE FROM token_history WHERE ts < datetime('now', ?)",
                 (f"-{HISTORY_RETENTION_DAYS} days",),
             )
+            conn.execute("PRAGMA incremental_vacuum")
     except Exception as e:
         logger.error(f"Failed to clean up history: {e}")
-    t = threading.Timer(86400, cleanup_old_history)
+
+    t = threading.Timer(ARCHIVE_INTERVAL_DAYS * 86400, archive_and_cleanup_history)
     t.daemon = True
     t.start()
 
@@ -401,7 +714,7 @@ def refresh_tokens():
         log_token_event("error", str(e))
 
 def fetch_sensor_data():
-    global sensors_data
+    global sensors_data, current_sensor_interval, last_moving_ts
     if not tokens_ok:
         logger.warning("Sensor data fetch skipped: tokens are not active")
         return
@@ -445,6 +758,35 @@ def fetch_sensor_data():
         write_json_file(DUMP_FILE, sensors_data)
         log_sensor_snapshot(sensors_data)
         logger.info("Sensor data updated")
+
+        # Адаптивный интервал опроса, с "остыванием" через
+        # SENSORS_REFRESH_COOLDOWN_SECONDS (см. комментарий у константы) —
+        # чтобы пробка (в том числе под эвакуатором) не сбрасывала опрос на
+        # медленный раньше времени. Пересчитываем только после УСПЕШНОГО
+        # снимка — если запрос упал с ошибкой, у нас нет свежих данных,
+        # чтобы понять едет машина или нет, поэтому в этом случае интервал
+        # не трогаем.
+        new_sensors = data.get("sensorsData") or {}
+        new_speed = (data.get("positionData") or {}).get("speed")
+        moving = bool(new_sensors.get("ignitionStatus")) or (
+            isinstance(new_speed, (int, float)) and new_speed > 0
+        )
+        now = time.time()
+        if moving:
+            last_moving_ts = now
+            desired_interval = SENSORS_REFRESH_INTERVAL_DRIVING
+        elif last_moving_ts is not None and (now - last_moving_ts) < SENSORS_REFRESH_COOLDOWN_SECONDS:
+            # стоим, но недавно ещё двигались (пробка/светофор/затор под
+            # эвакуатором) — остаёмся на быстром интервале "про запас"
+            desired_interval = SENSORS_REFRESH_INTERVAL_DRIVING
+        else:
+            desired_interval = SENSORS_REFRESH_INTERVAL
+        if desired_interval != current_sensor_interval:
+            logger.info(
+                f"Sensor poll interval switching to {desired_interval}s "
+                f"({'driving/moving' if moving else 'cooldown' if desired_interval == SENSORS_REFRESH_INTERVAL_DRIVING else 'idle'})"
+            )
+            current_sensor_interval = desired_interval
     except Exception as e:
         logger.error(f"Failed to fetch sensor data: {e}")
 
@@ -456,7 +798,7 @@ def periodic_refresh():
 
 def periodic_fetch():
     fetch_sensor_data()
-    t = threading.Timer(SENSORS_REFRESH_INTERVAL, periodic_fetch)
+    t = threading.Timer(current_sensor_interval, periodic_fetch)
     t.daemon = True
     t.start()
 
@@ -497,7 +839,8 @@ def status():
         "last_token_update": status_info["last_token_update"],
         "last_sensor_update": status_info["last_sensor_update"],
         "tokens_active": tokens_ok,
-        "current_refresh_interval": current_refresh_interval
+        "current_refresh_interval": current_refresh_interval,
+        "current_sensor_interval": current_sensor_interval
     })
 
 @app.route("/set_tokens", methods=["POST"])
@@ -736,7 +1079,7 @@ if __name__ == "__main__":
     status_info.update({k: v for k, v in loaded_status.items() if k in status_info})
 
     init_db()
-    cleanup_old_history()
+    archive_and_cleanup_history()
     periodic_refresh()
     periodic_fetch()
 
