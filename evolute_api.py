@@ -58,7 +58,11 @@ CAR_ID = os.getenv("CAR_ID", "SOME_CAR_ID_HASH_CHANGE_ME")
 # - 222222       — только "ignition" и "doors"
 # - 333333:all   — то же самое, что без фильтра (явно "все")
 # Доступные типы: movement, coords, coords_summary, ignition, connectivity,
-# doors, battery_full
+# doors, battery_full, archive
+# "archive" — короткая сводка после каждого запуска архивации БД (успех/
+# отправлено N записей/ничего не найдено/ошибка) + время следующего запуска.
+# Если у админа указан явный список типов (не "all"), "archive" в него нужно
+# добавить отдельно, иначе сводки по архивации приходить не будут.
 #
 # coords / coords_summary — это два взаимоисключающих режима получения
 # координат ИМЕННО во время поездки (зажигание включено):
@@ -80,7 +84,7 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 ALERT_TYPES = {
     "movement", "coords", "coords_summary", "ignition",
-    "connectivity", "doors", "battery_full",
+    "connectivity", "doors", "battery_full", "archive",
 }
 
 # Порог значимого перемещения для алерта "coords", в метрах. Обычный бытовой
@@ -361,6 +365,7 @@ def _finish_trip(ts: str, pos: dict, sensors: dict):
 def check_sensor_alerts(old_data: dict, new_data: dict):
     """Сравнивает предыдущий и новый снимок сенсоров и шлёт алерты
     только на смене состояния (edge-triggered), а не при каждом опросе:
+      - ignition       — зажигание включили/выключили;
       - movement       — скорость была 0/отсутствовала, стала > 0;
       - coords         — координаты изменились относительно прошлого снимка;
       - coords_summary — то же самое, но сжато: одна сводка по итогам
@@ -369,11 +374,21 @@ def check_sensor_alerts(old_data: dict, new_data: dict):
                           пока включено зажигание — при движении на
                           заглушенной машине (эвакуатор и т.п.) координаты
                           всё равно шлются сразу, без сжатия;
-      - ignition       — зажигание включили/выключили;
       - connectivity   — машина потеряла/восстановила связь (isOnline);
       - doors          — дверь или багажник открылись, пока машина на стоянке;
       - battery_full   — заряд батареи достиг 100% (во время самой зарядки,
                           пока % ниже 100, ничего не шлём — только на финише).
+    Порядок проверок ниже (зажигание -> движение -> координаты) намеренно
+    совпадает с логическим порядком событий реальной поездки: сначала
+    включили зажигание, затем машина тронулась, затем появились новые
+    координаты. Если несколько из этих событий попадают в один и тот же
+    снимок сенсоров (частый случай — именно так машина обычно и стартует),
+    уведомления должны прийти в Telegram именно в этом порядке, а не в
+    порядке, случайно зависящем от того, в каком месте функции стоит код.
+    Дополнительно это ещё и небольшой фикс: если сдвиг координат случился в
+    том же снимке, где включилось зажигание, то поездка (current_trip) на
+    момент проверки координат уже стартовала, и эта первая дистанция
+    корректно попадёт в сводку coords_summary, а не потеряется.
     На самом первом снимке после старта сервиса (old_data пуст) уведомления
     не шлём, чтобы не спамить при каждом рестарте — но если сервис
     перезапустился прямо посреди поездки (зажигание уже включено),
@@ -390,7 +405,20 @@ def check_sensor_alerts(old_data: dict, new_data: dict):
     new_sensors = new_data.get("sensorsData") or {}
     snapshot_ts = datetime.utcnow().isoformat()
 
-    # 1. Начало движения — только первый раз за поездку (см. movement_notified_this_trip
+    # 1. Зажигание вкл/выкл — идёт первым: это причина, а не следствие
+    #    движения/координат, так что уведомление о нём должно приходить
+    #    раньше остальных.
+    old_ignition = old_sensors.get("ignitionStatus")
+    new_ignition = new_sensors.get("ignitionStatus")
+    if old_ignition is not None and new_ignition is not None and old_ignition != new_ignition:
+        if new_ignition:
+            notify_admins("ignition", "🔑 Зажигание включено")
+            _start_trip(snapshot_ts, new_pos, new_sensors)
+        else:
+            notify_admins("ignition", "🔑 Зажигание выключено")
+            _finish_trip(snapshot_ts, new_pos, new_sensors)
+
+    # 2. Начало движения — только первый раз за поездку (см. movement_notified_this_trip
     #    выше): иначе каждая остановка на светофоре/в пробке (скорость падает
     #    до 0, потом снова растёт) заново триггерит этот алерт.
     global movement_notified_this_trip
@@ -405,7 +433,7 @@ def check_sensor_alerts(old_data: dict, new_data: dict):
         notify_admins("movement", f"🚗 Автомобиль начал движение\nСкорость: {new_speed} км/ч")
         movement_notified_this_trip = True
 
-    # 2. Смена координат — только если реальное расстояние больше порога
+    # 3. Смена координат — только если реальное расстояние больше порога
     #    COORDS_MIN_DISTANCE_METERS (см. объяснение у константы выше);
     #    мелкий GPS-шум на стоянке молчит.
     # Едем своим ходом (зажигание сейчас включено) -> "coords" получает
@@ -423,7 +451,7 @@ def check_sensor_alerts(old_data: dict, new_data: dict):
                 f"https://yandex.ru/maps/?rtext={old_lat},{old_lon}~{new_lat},{new_lon}&rtt=auto"
             )
             text = (
-                f"📍 Координаты изменились (~{distance:.0f} м по прямой)\n"
+                f"📍 Координаты изменились\n(~{distance:.0f} м по прямой)\n"
                 f"Было: {old_lat}, {old_lon}\nСтало: {new_lat}, {new_lon}\n\n"
                 f"{map_url}"
             )
@@ -435,17 +463,6 @@ def check_sensor_alerts(old_data: dict, new_data: dict):
                     current_trip["points"] += 1
             else:
                 notify_admins_any({"coords", "coords_summary"}, text)
-
-    # 3. Зажигание вкл/выкл
-    old_ignition = old_sensors.get("ignitionStatus")
-    new_ignition = new_sensors.get("ignitionStatus")
-    if old_ignition is not None and new_ignition is not None and old_ignition != new_ignition:
-        if new_ignition:
-            notify_admins("ignition", "🔑 Зажигание включено")
-            _start_trip(snapshot_ts, new_pos, new_sensors)
-        else:
-            notify_admins("ignition", "🔑 Зажигание выключено")
-            _finish_trip(snapshot_ts, new_pos, new_sensors)
 
     # 4. Потеря/восстановление связи
     old_online = old_data.get("isOnline")
@@ -570,8 +587,15 @@ def _split_rows_to_gzip_chunks(rows: list, columns: list[str], tmp_dir: str, pre
     return chunks
 
 
-def archive_and_cleanup_history():
-    """Каждые ARCHIVE_INTERVAL_DAYS суток:
+def _archive_once() -> dict:
+    """Один проход архивации+чистки, БЕЗ планирования следующего запуска.
+    Вынесено в отдельную функцию из archive_and_cleanup_history(), чтобы
+    её можно было безопасно дёрнуть вручную (например для ручного теста
+    из консоли контейнера) — вызов archive_and_cleanup_history() напрямую
+    для этого не годится, он в конце сам планирует свой следующий вызов
+    через threading.Timer и в одноразовом скрипте это просто зависший
+    процесс.
+    Логика:
     1) выгружает из sensor_history/token_history всё старше ARCHIVE_KEEP_DAYS
        в сжатые .jsonl.gz (порезанные под лимит файла бота Telegram);
     2) отправляет получившиеся части в TELEGRAM_ARCHIVE_CHAT_ID;
@@ -579,12 +603,29 @@ def archive_and_cleanup_history():
        рабочей БД и возвращает освободившееся место на диск через
        incremental_vacuum. Если отправка чего-то не удалась — ничего не
        удаляется, попробуем снова при следующем запуске.
-    Если TELEGRAM_ARCHIVE_CHAT_ID не задан, шаги 1-3 просто пропускаются.
-    В любом случае в конце выполняется старая страховочная чистка по
-    HISTORY_RETENTION_DAYS, чтобы БД не росла бесконечно, даже если
-    архивация выключена или постоянно падает."""
+    Если TELEGRAM_ARCHIVE_CHAT_ID (или TELEGRAM_BOT_TOKEN) не задан, шаги
+    1-3 пропускаются — это явно отражается в возвращаемом result, чтобы
+    вызывающий код мог предупредить о неполной настройке, а не просто
+    молчать. В любом случае в конце выполняется старая страховочная чистка
+    по HISTORY_RETENTION_DAYS, чтобы БД не росла бесконечно, даже если
+    архивация выключена или постоянно падает.
+    Возвращает словарь с деталями прогона — для логов, /archive_status и
+    Telegram-уведомления типа "archive"."""
+    run_started = datetime.utcnow()
+    result = {
+        "started": run_started.isoformat(),
+        "bot_token_set": bool(TELEGRAM_BOT_TOKEN),
+        "archive_chat_set": bool(TELEGRAM_ARCHIVE_CHAT_ID),
+        "config_ok": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_ARCHIVE_CHAT_ID),
+        "sensor_rows": 0,
+        "token_rows": 0,
+        "chunks_sent": 0,
+        "archived_ok": None,  # None = архивация в Telegram пропущена (не настроена)
+        "error": None,
+    }
+
     if TELEGRAM_ARCHIVE_CHAT_ID:
-        cutoff = (datetime.utcnow() - timedelta(days=ARCHIVE_KEEP_DAYS)).isoformat()
+        cutoff = (run_started - timedelta(days=ARCHIVE_KEEP_DAYS)).isoformat()
         tmp_dir = tempfile.mkdtemp(prefix="evolute_archive_")
         try:
             with db_lock, sqlite3.connect(DB_FILE) as conn:
@@ -596,9 +637,11 @@ def archive_and_cleanup_history():
                     "SELECT id, ts, event, detail FROM token_history WHERE ts < ? ORDER BY ts",
                     (cutoff,),
                 ).fetchall()
+            result["sensor_rows"] = len(sensor_rows)
+            result["token_rows"] = len(token_rows)
 
             if sensor_rows or token_rows:
-                date_tag = datetime.utcnow().strftime("%Y%m%d_%H%M")
+                date_tag = run_started.strftime("%Y%m%d_%H%M")
                 chunks = _split_rows_to_gzip_chunks(
                     sensor_rows, ["id", "ts", "data"], tmp_dir, f"sensor_history_{date_tag}"
                 ) + _split_rows_to_gzip_chunks(
@@ -612,6 +655,7 @@ def archive_and_cleanup_history():
                         all_ok = False
                         logger.error(f"Archive chunk send failed on {path}, aborting this run")
                         break
+                    result["chunks_sent"] += 1
                     # небольшая пауза между сообщениями, чтобы не словить
                     # flood control одного чата в Telegram
                     time.sleep(2)
@@ -621,16 +665,33 @@ def archive_and_cleanup_history():
                         conn.execute("DELETE FROM sensor_history WHERE ts < ?", (cutoff,))
                         conn.execute("DELETE FROM token_history WHERE ts < ?", (cutoff,))
                         conn.execute("PRAGMA incremental_vacuum")
+                    result["archived_ok"] = True
                     logger.info(
                         f"Archived & purged {len(sensor_rows)} sensor_history + "
                         f"{len(token_rows)} token_history rows older than {cutoff}"
                     )
                 else:
+                    result["archived_ok"] = False
+                    result["error"] = "send_failed"
                     logger.error("Archive run incomplete — old rows kept in DB, will retry next run")
+            else:
+                # Не ошибка: конфигурация в порядке, просто ещё нет записей
+                # старше ARCHIVE_KEEP_DAYS — самый частый случай, из-за
+                # которого архив как будто "не приходит".
+                result["archived_ok"] = True
+                logger.info(f"Archive: nothing older than {cutoff} yet, nothing to send")
         except Exception as e:
+            result["archived_ok"] = False
+            result["error"] = str(e)
             logger.error(f"Archive job failed: {e}")
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+    else:
+        logger.warning(
+            "Archive: TELEGRAM_ARCHIVE_CHAT_ID не задан — архивация БД в "
+            "Telegram выключена, работает только страховочная чистка по "
+            "HISTORY_RETENTION_DAYS"
+        )
 
     # Страховочная чистка (старое поведение) — работает независимо от
     # архивации, чтобы совсем старые данные не копились бесконечно ни при
@@ -649,6 +710,54 @@ def archive_and_cleanup_history():
     except Exception as e:
         logger.error(f"Failed to clean up history: {e}")
 
+    return result
+
+
+def archive_and_cleanup_history():
+    """Периодический драйвер: раз в ARCHIVE_INTERVAL_DAYS суток выполняет
+    один проход _archive_once(), логирует и шлёт в Telegram (алерт типа
+    "archive") короткую сводку о результате вместе со временем следующего
+    запуска, обновляет status_info (виден через /archive_status), и
+    планирует свой следующий вызов."""
+    result = _archive_once()
+    next_run = datetime.utcnow() + timedelta(days=ARCHIVE_INTERVAL_DAYS)
+    next_run_str = next_run.strftime("%Y-%m-%d %H:%M UTC")
+
+    if not result["config_ok"]:
+        missing = "TELEGRAM_BOT_TOKEN" if not result["bot_token_set"] else "TELEGRAM_ARCHIVE_CHAT_ID"
+        summary = (
+            f"⚠️ Архивация БД в Telegram не настроена (не задан {missing}).\n"
+            "Работает только страховочная чистка по HISTORY_RETENTION_DAYS, "
+            "файлы архива отправляться не будут.\n"
+            f"Следующая проверка: {next_run_str}"
+        )
+    elif result["archived_ok"] is False:
+        summary = (
+            f"❌ Архивация БД не удалась ({result['error']}). Старые записи "
+            "оставлены в рабочей БД, повторим на следующем запуске.\n"
+            f"Следующая попытка: {next_run_str}"
+        )
+    elif result["sensor_rows"] == 0 and result["token_rows"] == 0:
+        summary = (
+            "📦 Архивация БД: отправлять пока нечего "
+            f"(нет записей старше {ARCHIVE_KEEP_DAYS:g} дн.).\n"
+            f"Следующая проверка: {next_run_str}"
+        )
+    else:
+        summary = (
+            f"📦 Архив БД отправлен: {result['sensor_rows']} sensor + "
+            f"{result['token_rows']} token записей, {result['chunks_sent']} файл(ов).\n"
+            f"Следующая архивация: {next_run_str}"
+        )
+
+    logger.info(f"Archive run summary: {summary}")
+    notify_admins("archive", summary)
+
+    status_info["last_archive_run"] = result["started"]
+    status_info["last_archive_summary"] = summary
+    status_info["next_archive_run"] = next_run.isoformat()
+    write_json_file(STATUS_FILE, status_info)
+
     t = threading.Timer(ARCHIVE_INTERVAL_DAYS * 86400, archive_and_cleanup_history)
     t.daemon = True
     t.start()
@@ -658,6 +767,9 @@ status_info = {
     "start_time": datetime.utcnow().isoformat(),
     "last_token_update": None,
     "last_sensor_update": None,
+    "last_archive_run": None,
+    "last_archive_summary": None,
+    "next_archive_run": None,
 }
 tokens_ok = False
 start_timestamp = time.time()
@@ -862,6 +974,22 @@ def status():
         "tokens_active": tokens_ok,
         "current_refresh_interval": current_refresh_interval,
         "current_sensor_interval": current_sensor_interval
+    })
+
+@app.route("/archive_status", methods=["GET"])
+def archive_status():
+    """Статус архивации БД в Telegram — когда был последний запуск, что он
+    сделал (сводка тем же текстом, что уходит в Telegram-алерт "archive"),
+    и когда ожидается следующий. Плюс текущая конфигурация, чтобы сразу
+    было видно, чего не хватает, без похода в переменные окружения."""
+    return jsonify({
+        "archive_chat_configured": bool(TELEGRAM_ARCHIVE_CHAT_ID),
+        "bot_token_configured": bool(TELEGRAM_BOT_TOKEN),
+        "archive_interval_days": ARCHIVE_INTERVAL_DAYS,
+        "archive_keep_days": ARCHIVE_KEEP_DAYS,
+        "last_archive_run": status_info["last_archive_run"],
+        "last_archive_summary": status_info["last_archive_summary"],
+        "next_archive_run": status_info["next_archive_run"],
     })
 
 @app.route("/set_tokens", methods=["POST"])
