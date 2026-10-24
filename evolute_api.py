@@ -133,6 +133,16 @@ STATUS_FILE = "status.json"
 EVOLUTE_REFRESH_URL = "https://app.evassist.ru/id-service/auth/refresh-token"
 EVOLUTE_SENSOR_URL = f"https://app.evassist.ru/car-service/tbox/{CAR_ID}/info"
 
+# Новый источник данных датчиков — тот, которым пользуется сайт (раздел
+# «Автопарк → Автомобиль»): /client-bff-service/telemetry/<IMEI>. Если CAR_IMEI
+# задан, датчики берутся оттуда, а CAR_ID по-прежнему нужен для команд
+# (/tbox/..., /tbox-i/...). Если CAR_IMEI не задан — работает прежний /info.
+CAR_IMEI = os.getenv("CAR_IMEI", "").strip()
+EVOLUTE_TELEMETRY_URL = (
+    f"https://app.evassist.ru/client-bff-service/telemetry/{CAR_IMEI}" if CAR_IMEI else None
+)
+TELEMETRY_TIME_ZONE = os.getenv("TELEMETRY_TIME_ZONE", "3")  # заголовок time-zone, как у браузера
+
 INTELLIGENT_ACTIONS = {
     "lock_close": ("centralLockingToggle", "centralLockingStatus", 1),
     "lock_open": ("centralLockingToggle", "centralLockingStatus", 0),
@@ -846,6 +856,97 @@ def refresh_tokens():
         logger.error(f"Failed to refresh tokens: {e}")
         log_token_event("error", str(e))
 
+def _num(v, ndigits=3):
+    """'56' -> 56, '12.65999984741211' -> 12.66. Всё, что не строка-число, возвращает как есть.
+    ndigits=None — не округлять (для координат)."""
+    if isinstance(v, str):
+        try:
+            return int(v)
+        except ValueError:
+            try:
+                f = float(v)
+            except ValueError:
+                return v
+            return f if ndigits is None else round(f, ndigits)
+    return v
+
+
+def _ms_to_iso(ms):
+    try:
+        return datetime.utcfromtimestamp(ms / 1000).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _estimate_speed_kmh(prev_pos, prev_at, pos, pos_at):
+    """В telemetry нет скорости — оцениваем по смещению между двумя снимками.
+    Это средняя скорость за интервал опроса, а не мгновенная."""
+    try:
+        coords = (prev_pos.get("lat"), prev_pos.get("lon"), pos.get("lat"), pos.get("lon"))
+        if None in coords or prev_at is None or pos_at is None:
+            return None
+        dt = (pos_at - prev_at) / 1000.0
+        if dt <= 0:
+            return prev_pos.get("speed")  # новой GPS-точки не было
+        if dt > 900:
+            return None  # слишком большой разрыв, оценка бессмысленна
+        dist = haversine_meters(*coords)
+        if dist < 20:  # дрейф GPS на стоянке
+            return 0
+        return round(dist / dt * 3.6, 1)
+    except Exception:
+        return None
+
+
+def normalize_telemetry(raw: dict, prev: dict) -> dict:
+    """Приводит ответ /client-bff-service/telemetry/<IMEI> к тому же виду, что давал
+    /info: positionData + sensorsData + isOnline/isParked/lastOnlineTime/prep*.
+    Так /sensors/all, история в БД, алерты и веб-клиент работают без изменений."""
+    src = dict(raw.get("sensors") or {})
+    buttons = raw.get("buttons") or []
+
+    pos = {}
+    for k in ("lat", "lon", "course"):
+        if k in src:
+            pos[k] = _num(src.pop(k), None)
+    speed = _num(src.pop("speed", None), None)
+    src.pop("isOnline", None)
+
+    sensors = {k: _num(v) for k, v in src.items()}
+
+    # Имена, которые ждёт остальной код (алерты, /tbox-i, клиент)
+    if "isIgnitionOn" in sensors:
+        sensors["ignitionStatus"] = int(bool(sensors["isIgnitionOn"]))
+    if "isCentralLockingOn" in sensors:
+        sensors["centralLockingStatus"] = int(bool(sensors["isCentralLockingOn"]))
+    if buttons:
+        sensors["climateStatus"] = int(any(
+            b.get("status") for b in buttons if b.get("activateCommand") in ("heatingOn", "coolingOn")))
+
+    pos_at = raw.get("positionAt")
+    if speed is None:
+        speed = _estimate_speed_kmh((prev or {}).get("positionData") or {},
+                                    (prev or {}).get("positionAt"), pos, pos_at)
+        if speed is not None:
+            pos["speedEstimated"] = True
+    if speed is not None:
+        pos["speed"] = speed
+
+    prep = next((b for b in buttons if b.get("tag") == "trip-preparation"), {})
+    return {
+        "positionData": pos,
+        "sensorsData": sensors,
+        "isOnline": raw.get("isOnline"),
+        "onlineState": raw.get("onlineState"),
+        "isParked": sensors.get("isParkedOn"),
+        "lastOnlineTime": _ms_to_iso(raw.get("carStateUpdatedAt")),
+        "carStateUpdatedAt": raw.get("carStateUpdatedAt"),
+        "positionAt": pos_at,
+        "prepRunning": prep.get("status"),
+        "prepAvailable": prep.get("enabled"),
+    }
+
+
 def fetch_sensor_data():
     global sensors_data, current_sensor_interval, last_moving_ts
     if not tokens_ok:
@@ -857,29 +958,44 @@ def fetch_sensor_data():
             "evy-platform-access": tokens["access"],
             "evy-platform-refresh": tokens["refresh"]
         }
-        headers = {
-            "User-Agent": USER_AGENT
-        }
-        response = requests.get(EVOLUTE_SENSOR_URL, headers=headers, cookies=cookies, timeout=TIMEOUT)
-        response.raise_for_status()
-        raw = response.json()
+        if EVOLUTE_TELEMETRY_URL:
+            headers = {
+                "User-Agent": USER_AGENT,
+                "x-app": "web",
+                "time-zone": TELEMETRY_TIME_ZONE,
+            }
+            response = requests.get(EVOLUTE_TELEMETRY_URL, headers=headers, cookies=cookies, timeout=TIMEOUT)
+            response.raise_for_status()
+            data = normalize_telemetry(response.json(), sensors_data)
+        else:
+            headers = {
+                "User-Agent": USER_AGENT
+            }
+            response = requests.get(EVOLUTE_SENSOR_URL, headers=headers, cookies=cookies, timeout=TIMEOUT)
+            response.raise_for_status()
+            raw = response.json()
 
-        keys = JSON_SUB.strip(".").split(".")
-        data = raw
-        for k in keys:
-            data = data.get(k, {})
+            keys = JSON_SUB.strip(".").split(".")
+            data = raw
+            for k in keys:
+                data = data.get(k, {})
 
-        # JSON_SUB=".sensors" отбрасывает всё, кроме ветки sensors — а эти поля
-        # лежат в корне raw-ответа рядом с ней. Подмешиваем их как соседей
-        # sensorsData/positionData, чтобы забирать через уже существующий
-        # /sensors/<name> (isOnline, isParked, lastOnlineTime, prepRunning, prepAvailable)
-        # без отдельных новых эндпоинтов.
-        prep = raw.get("preparation_script") or {}
-        data["isOnline"] = raw.get("isOnline")
-        data["isParked"] = raw.get("isParked")
-        data["lastOnlineTime"] = raw.get("lastOnlineTime")
-        data["prepRunning"] = prep.get("running")
-        data["prepAvailable"] = prep.get("available")
+            # JSON_SUB=".sensors" отбрасывает всё, кроме ветки sensors — а эти поля
+            # лежат в корне raw-ответа рядом с ней. Подмешиваем их как соседей
+            # sensorsData/positionData, чтобы забирать через уже существующий
+            # /sensors/<name> (isOnline, isParked, lastOnlineTime, prepRunning, prepAvailable)
+            # без отдельных новых эндпоинтов.
+            prep = raw.get("preparation_script") or {}
+            data["isOnline"] = raw.get("isOnline")
+            data["isParked"] = raw.get("isParked")
+            data["lastOnlineTime"] = raw.get("lastOnlineTime")
+            data["prepRunning"] = prep.get("running")
+            data["prepAvailable"] = prep.get("available")
+
+            if not data.get("sensorsData"):
+                logger.warning(
+                    "В ответе нет sensorsData (JSON_SUB=%r): машина офлайн или изменилась "
+                    "структура ответа — проверьте probe_api.py raw", JSON_SUB)
 
         try:
             check_sensor_alerts(sensors_data, data)
@@ -1078,6 +1194,12 @@ def get_all_positions():
 def get_single_sensor(sensor_name):
     check_auth_rw(request)
     value = sensors_data.get(sensor_name)
+    if value is None:
+        # не нашли на верхнем уровне — ищем среди датчиков и позиции
+        for group in ("sensorsData", "positionData"):
+            value = (sensors_data.get(group) or {}).get(sensor_name)
+            if value is not None:
+                break
     if value is None:
         return jsonify({"error": "sensor not found"}), 404
     return jsonify({sensor_name: value})
