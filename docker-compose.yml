@@ -9,9 +9,12 @@ services:
       LISTEN: 0.0.0.0
       PORT: 12321
       CAR_ID: "SOME_CAR_ID_HASH_CHANGE_ME"
+      # IMEI — источник датчиков /client-bff-service/telemetry/<IMEI> (необязательно)
+      CAR_IMEI: "864756086071869"
       API_KEY: "changeme"
       API_KEY_RW: "changeme_rw"
       # Origin, с которого разрешены запросы к прокси.
       # Для клиента, опубликованного на GitHub Pages:
       # ALLOWED_ORIGIN: "https://<login>.github.io"
       ALLOWED_ORIGIN: "*"
+      
