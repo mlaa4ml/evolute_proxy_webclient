@@ -12,7 +12,8 @@ import tempfile
 import shutil
 import requests
 from flask import Flask, request, jsonify, abort
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from flask import Response
 from urllib.parse import urljoin
 
@@ -58,7 +59,10 @@ CAR_ID = os.getenv("CAR_ID", "SOME_CAR_ID_HASH_CHANGE_ME")
 # - 222222       — только "ignition" и "doors"
 # - 333333:all   — то же самое, что без фильтра (явно "все")
 # Доступные типы: movement, coords, coords_summary, ignition, connectivity,
-# doors, battery_full, archive
+# doors, battery_full, archive, voltage_low, voltage_charge
+# "voltage_low" — 12V АКБ: низкое напряжение (мгновенно); "voltage_charge" —
+# суточная сводка о подзарядках 12V (см. блок «Мониторинг 12V АКБ» ниже).
+# Как и "archive", при явном списке типов у админа их нужно добавить отдельно.
 # "archive" — короткая сводка после каждого запуска архивации БД (успех/
 # отправлено N записей/ничего не найдено/ошибка) + время следующего запуска.
 # Если у админа указан явный список типов (не "all"), "archive" в него нужно
@@ -85,6 +89,7 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 ALERT_TYPES = {
     "movement", "coords", "coords_summary", "ignition",
     "connectivity", "doors", "battery_full", "archive",
+    "voltage_low", "voltage_charge",
 }
 
 # Порог значимого перемещения для алерта "coords", в метрах. Обычный бытовой
@@ -500,6 +505,312 @@ def check_sensor_alerts(old_data: dict, new_data: dict):
         notify_admins("battery_full", "🔋 Зарядка завершена: батарея заряжена на 100%")
 
 
+# ---------------------------------------------------------------------------
+# Мониторинг 12V АКБ: низкое напряжение, подзарядка, суточная сводка.
+#
+# Что известно по реальной истории этой машины:
+#   - в покое 12V стоит на ~12.75-12.85 В (после поездок первые часы чуть
+#     ниже, ~12.55-12.6 В);
+#   - подзарядка идёт от DC-DC и держится на 13.57-13.70 В в поездке и
+#     13.73-13.76 В во время зарядки тяговой батареи на стоянке (зажигание
+#     при этом выкл); в момент остановки DC-DC напряжение падает сразу;
+#   - сразу после остановки DC-DC (конец поездки/зарядки) 12V на 1-3 минуты
+#     проваливается до ~12.38-12.5 В и потом возвращается к 12.55+. Это не
+#     разряд, поэтому "низкое напряжение" подтверждается по ВРЕМЕНИ, а не по
+#     числу снимков.
+#
+# Алерты:
+#   "voltage_low"    — мгновенные: низкое/критически низкое напряжение, восстановление;
+#   "voltage_charge" — суточная сводка о подзарядках (VOLTAGE_DIGEST_TIME) и,
+#                      если включено VOLTAGE_CHARGE_NOTIFY, мгновенные сообщения
+#                      об окончании подзарядки.
+# Каждая завершённая подзарядка пишется в таблицу voltage_charge_events.
+# Как и "archive", админу с явным списком типов их нужно добавить отдельно.
+# ---------------------------------------------------------------------------
+VOLTAGE_SENSOR_KEY = os.getenv("VOLTAGE_SENSOR_KEY", "12VBatteryVoltage").strip()
+VOLTAGE_LOW_WARN = float(os.getenv("VOLTAGE_LOW_WARN", 12.4))
+VOLTAGE_LOW_CRIT = float(os.getenv("VOLTAGE_LOW_CRIT", 12.0))
+VOLTAGE_LOW_RECOVER = float(os.getenv("VOLTAGE_LOW_RECOVER", 12.6))   # гистерезис выхода из "низкого"
+VOLTAGE_LOW_CONFIRM_MINUTES = float(os.getenv("VOLTAGE_LOW_CONFIRM_MINUTES", 15))      # сколько держится <= WARN
+VOLTAGE_LOW_CRIT_CONFIRM_MINUTES = float(os.getenv("VOLTAGE_LOW_CRIT_CONFIRM_MINUTES", 5))  # сколько держится <= CRIT
+VOLTAGE_LOW_REMINDER_HOURS = float(os.getenv("VOLTAGE_LOW_REMINDER_HOURS", 6))  # 0 = без напоминаний
+VOLTAGE_CHARGE_ON = float(os.getenv("VOLTAGE_CHARGE_ON", 13.3))      # >= этого — идёт подзарядка
+VOLTAGE_CHARGE_OFF = float(os.getenv("VOLTAGE_CHARGE_OFF", 13.1))    # < этого — подзарядка закончилась
+VOLTAGE_CONFIRM_SNAPSHOTS = int(os.getenv("VOLTAGE_CONFIRM_SNAPSHOTS", 2))  # свежих снимков подряд для старта/конца подзарядки
+VOLTAGE_CHARGE_MIN_MINUTES = float(os.getenv("VOLTAGE_CHARGE_MIN_MINUTES", 2))  # короче — шум, в историю/сводку не попадает
+# Мгновенное сообщение об окончании подзарядки: none | unknown (только если
+# источник не определён — внешнее ЗУ/"прикуриватель") | all
+VOLTAGE_CHARGE_NOTIFY = os.getenv("VOLTAGE_CHARGE_NOTIFY", "none").strip().lower()
+VOLTAGE_DIGEST_TIME = os.getenv("VOLTAGE_DIGEST_TIME", "20:10").strip()   # "" = сводка выключена
+VOLTAGE_DIGEST_TZ = os.getenv("VOLTAGE_DIGEST_TZ", "Europe/Moscow").strip()
+
+voltage_state = {
+    "key": None, "value": None, "ts": None, "stamp": None,
+    "low_level": None, "low_seen": None, "low_since": None, "low_last_notified": 0.0,
+    "charging": False, "on_count": 0, "off_count": 0, "charge": None,
+}
+
+VOLTAGE_KIND_LABELS = {
+    "hv_charge": "зарядка тяговой на стоянке",
+    "trip": "поездка",
+    "unknown": "источник не определён (внешнее ЗУ/фон)",
+}
+
+
+def _find_voltage(sensors: dict):
+    """(ключ, значение в вольтах) 12V-напряжения из sensorsData или (None, None).
+    Сначала VOLTAGE_SENSOR_KEY, иначе первый ключ с 'volt' в названии (кроме
+    явно высоковольтных). Значения вне 6-20 В считаем мусором."""
+    candidates = []
+    if VOLTAGE_SENSOR_KEY and VOLTAGE_SENSOR_KEY in sensors:
+        candidates.append(VOLTAGE_SENSOR_KEY)
+    candidates += [k for k in sensors
+                   if k != VOLTAGE_SENSOR_KEY and re.search(r"volt", k, re.I)
+                   and not re.search(r"hv|high|traction|cell", k, re.I)]
+    for k in candidates:
+        val = sensors.get(k)
+        if isinstance(val, (int, float)) and 6 <= val <= 20:
+            return k, float(val)
+    return None, None
+
+
+def _utc_iso(ts: float) -> str:
+    return datetime.utcfromtimestamp(ts).isoformat()
+
+
+def _save_voltage_event(ch: dict, kind: str, minutes: float):
+    try:
+        with db_lock, sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                "INSERT INTO voltage_charge_events "
+                "(ts_start, ts_end, kind, minutes, v_min, v_peak, pct_start, pct_end) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (_utc_iso(ch["start"]), _utc_iso(ch["last_high"]), kind, round(minutes, 1),
+                 ch["v_min"], ch["v_peak"], ch["pct_start"], ch["pct_last"]),
+            )
+    except Exception as e:
+        logger.error(f"Failed to save voltage event: {e}")
+
+
+def _touch_charge(ch: dict, v: float, batt, powered: bool, now: float):
+    ch["last_high"] = now
+    ch["v_min"], ch["v_peak"] = min(ch["v_min"], v), max(ch["v_peak"], v)
+    if batt is not None:
+        ch["pct_last"] = batt
+        if ch["pct_start"] is None:
+            ch["pct_start"] = batt
+    ch["ign"] = ch["ign"] or powered
+
+
+def _finish_charge(ch: dict, now: float):
+    minutes = max(ch["last_high"] - ch["start"], 0) / 60
+    if minutes < VOLTAGE_CHARGE_MIN_MINUTES:
+        return
+    if ch["ign"]:
+        kind = "trip"
+    elif ch["pct_start"] is not None and ch["pct_last"] is not None and ch["pct_last"] - ch["pct_start"] >= 1:
+        kind = "hv_charge"
+    else:
+        kind = "unknown"
+    _save_voltage_event(ch, kind, minutes)
+    if VOLTAGE_CHARGE_NOTIFY == "all" or (VOLTAGE_CHARGE_NOTIFY == "unknown" and kind == "unknown"):
+        pct = (f", тяговая {ch['pct_start']:g}→{ch['pct_last']:g}%"
+               if ch["pct_start"] is not None and ch["pct_last"] is not None else "")
+        notify_admins("voltage_charge",
+                      f"🔋 12V АКБ: подзарядка закончилась — {VOLTAGE_KIND_LABELS[kind]}\n"
+                      f"{_fmt_minutes(minutes)}, {ch['v_min']:.2f}–{ch['v_peak']:.2f} В{pct}")
+
+
+def check_voltage_alerts(data: dict):
+    st = voltage_state
+    if data.get("isOnline") is False:
+        return  # машина офлайн — в данных последнее известное, не свежее значение
+    # Один и тот же устаревший снимок не должен засчитываться как несколько
+    # подтверждений подряд.
+    stamp = data.get("carStateUpdatedAt") or data.get("lastOnlineTime")
+    if stamp is not None and stamp == st["stamp"]:
+        return
+    st["stamp"] = stamp
+
+    sensors = data.get("sensorsData") or {}
+    key, v = _find_voltage(sensors)
+    st["key"] = key
+    if v is None:
+        return
+    now = time.time()
+    st["value"], st["ts"] = v, datetime.utcnow().isoformat()
+
+    batt = sensors.get("batteryPercentage")
+    batt = batt if isinstance(batt, (int, float)) else None
+    powered = bool(sensors.get("ignitionStatus")) or bool(sensors.get("ready"))
+
+    # --- 1. Низкое напряжение: подтверждается ВРЕМЕНЕМ, с гистерезисом и напоминанием ---
+    level = "crit" if v <= VOLTAGE_LOW_CRIT else "warn" if v <= VOLTAGE_LOW_WARN else None
+    if level:
+        if level != st["low_seen"]:
+            st["low_seen"], st["low_since"] = level, now  # смена уровня подтверждаем заново
+        need = (VOLTAGE_LOW_CRIT_CONFIRM_MINUTES if level == "crit" else VOLTAGE_LOW_CONFIRM_MINUTES) * 60
+        if now - st["low_since"] >= need:
+            remind = (VOLTAGE_LOW_REMINDER_HOURS > 0
+                      and now - st["low_last_notified"] >= VOLTAGE_LOW_REMINDER_HOURS * 3600)
+            escalated = level == "crit" and st["low_level"] == "warn"
+            if st["low_level"] is None or escalated or remind:
+                icon, title = ("🛑", "критически низкое") if level == "crit" else ("🪫", "низкое")
+                lines = [f"{icon} 12V АКБ: {title} напряжение — {v:.2f} В "
+                         f"(держится ~{(now - st['low_since']) / 60:.0f} мин)"]
+                if powered:
+                    lines.append("Машина включена, а напряжение низкое — возможно, не работает подзарядка (DC-DC).")
+                else:
+                    lines.append("Батарея разряжена — риск, что машина не проснётся/не заведётся.")
+                notify_admins("voltage_low", "\n".join(lines))
+                st["low_level"], st["low_last_notified"] = level, now
+    else:
+        st["low_seen"], st["low_since"] = None, None
+        if st["low_level"] and v >= VOLTAGE_LOW_RECOVER:
+            notify_admins("voltage_low", f"✅ 12V АКБ: напряжение восстановилось — {v:.2f} В")
+            st["low_level"] = None
+
+    # --- 2. Подзарядка 12V: по росту напряжения (ON/OFF с гистерезисом) ---
+    if not st["charging"]:
+        if v >= VOLTAGE_CHARGE_ON:
+            if st["on_count"] == 0:
+                st["charge"] = {"start": now, "last_high": now, "v_min": v, "v_peak": v,
+                                "pct_start": batt, "pct_last": batt, "ign": powered}
+            else:
+                _touch_charge(st["charge"], v, batt, powered, now)
+            st["on_count"] += 1
+            if st["on_count"] >= VOLTAGE_CONFIRM_SNAPSHOTS:
+                st["charging"], st["on_count"], st["off_count"] = True, 0, 0
+        else:
+            st["on_count"], st["charge"] = 0, None
+    else:
+        ch = st["charge"]
+        if v >= VOLTAGE_CHARGE_OFF:
+            _touch_charge(ch, v, batt, powered, now)
+            st["off_count"] = 0
+        else:
+            st["off_count"] += 1
+            if st["off_count"] >= VOLTAGE_CONFIRM_SNAPSHOTS:
+                _finish_charge(ch, now)
+                st["charging"], st["charge"], st["on_count"], st["off_count"] = False, None, 0, 0
+
+
+# --- Суточная сводка -------------------------------------------------------
+def _fmt_minutes(m: float) -> str:
+    m = int(round(m))
+    h, mm = divmod(m, 60)
+    return f"{h} ч {mm:02d} мин" if h else f"{mm} мин"
+
+
+def _digest_tz():
+    try:
+        return ZoneInfo(VOLTAGE_DIGEST_TZ)
+    except Exception:
+        logger.warning(f"Voltage digest: часовой пояс '{VOLTAGE_DIGEST_TZ}' недоступен "
+                       f"(нет tzdata?), использую UTC+3")
+        return timezone(timedelta(hours=3))
+
+
+def _digest_hm():
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", VOLTAGE_DIGEST_TIME or "")
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _meta_get(key: str):
+    with db_lock, sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute("SELECT value FROM voltage_meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _meta_set(key: str, value: str):
+    with db_lock, sqlite3.connect(DB_FILE) as conn:
+        conn.execute("INSERT OR REPLACE INTO voltage_meta (key, value) VALUES (?, ?)", (key, value))
+
+
+def build_voltage_digest(end_local: datetime) -> str:
+    """Сводка за 24 часа, заканчивающиеся в end_local (aware datetime)."""
+    tz = end_local.tzinfo
+    start_local = end_local - timedelta(days=1)
+    to_utc = lambda d: d.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+    s_iso, e_iso = to_utc(start_local), to_utc(end_local)
+    loc = lambda iso: datetime.fromisoformat(iso).replace(tzinfo=timezone.utc).astimezone(tz).strftime("%H:%M")
+
+    with db_lock, sqlite3.connect(DB_FILE) as conn:
+        events = conn.execute(
+            "SELECT ts_start, ts_end, kind, minutes, v_min, v_peak, pct_start, pct_end "
+            "FROM voltage_charge_events WHERE ts_end > ? AND ts_end <= ? ORDER BY ts_start",
+            (s_iso, e_iso)).fetchall()
+        raw_rows = conn.execute(
+            "SELECT data FROM sensor_history WHERE ts > ? AND ts <= ?", (s_iso, e_iso)).fetchall()
+
+    items = [(a, b, k, m, lo, hi, p0, p1, False) for a, b, k, m, lo, hi, p0, p1 in events]
+    ch = voltage_state["charge"] if voltage_state["charging"] else None
+    if ch:  # подзарядка идёт прямо сейчас
+        kind = ("trip" if ch["ign"] else "hv_charge" if ch["pct_start"] is not None and ch["pct_last"] is not None
+                and ch["pct_last"] - ch["pct_start"] >= 1 else "unknown")
+        items.append((_utc_iso(ch["start"]), _utc_iso(ch["last_high"]), kind,
+                      (ch["last_high"] - ch["start"]) / 60, ch["v_min"], ch["v_peak"],
+                      ch["pct_start"], ch["pct_last"], True))
+
+    lines = [f"🔋 12V АКБ — сводка за сутки (до {end_local.strftime('%H:%M')})", ""]
+    if items:
+        total = sum(i[3] for i in items)
+        lines.append(f"Подзарядок 12V: {len(items)}, всего {_fmt_minutes(total)}")
+        for a, b, k, m, lo, hi, p0, p1, ongoing in items[:15]:
+            pct = f" · тяговая {p0:g}→{p1:g}%" if p0 is not None and p1 is not None else ""
+            warn = "⚠️ " if k == "unknown" else ""
+            end = "идёт" if ongoing else loc(b)
+            lines.append(f"• {warn}{loc(a)}–{end} · {VOLTAGE_KIND_LABELS.get(k, k)} · "
+                         f"{_fmt_minutes(m)} · {lo:.2f}–{hi:.2f} В{pct}")
+        if len(items) > 15:
+            lines.append(f"… и ещё {len(items) - 15}")
+    else:
+        lines.append("Подзарядок за сутки не было.")
+
+    rest = []
+    for (raw,) in raw_rows:
+        try:
+            d = json.loads(raw)
+            s = d.get("sensorsData") or {}
+            _, val = _find_voltage(s)
+            if val is not None and not s.get("ignitionStatus") and val < VOLTAGE_CHARGE_OFF:
+                rest.append(val)
+        except Exception:
+            continue
+    if len(rest) >= 10:
+        rest.sort()
+        lines += ["", f"В покое (вне подзарядки): медиана {rest[len(rest) // 2]:.2f} В, "
+                      f"диапазон {rest[0]:.2f}–{rest[-1]:.2f} В"]
+    st = voltage_state
+    if st["value"] is not None:
+        lines.append(f"Сейчас: {st['value']:.2f} В")
+    if st["low_level"]:
+        lines.append(f"⚠️ Активно предупреждение о низком напряжении ({st['low_level']}).")
+    return "\n".join(lines)
+
+
+def voltage_digest_tick():
+    """Раз в минуту проверяет, не пора ли слать суточную сводку. Дата последней
+    отправки хранится в БД, поэтому перезапуск сервиса не даёт дублей."""
+    try:
+        hm = _digest_hm()
+        if hm:
+            now_local = datetime.now(_digest_tz())
+            today = now_local.date().isoformat()
+            if (now_local.hour, now_local.minute) >= hm and _meta_get("digest_last_date") != today:
+                end_local = now_local.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
+                notify_admins("voltage_charge", build_voltage_digest(end_local))
+                _meta_set("digest_last_date", today)
+    except Exception as e:
+        logger.error(f"Voltage digest failed: {e}")
+    finally:
+        t = threading.Timer(60, voltage_digest_tick)
+        t.daemon = True
+        t.start()
+
+
 # sqlite3-соединения не шарятся между потоками (у нас Flask-потоки запросов +
 # отдельные threading.Timer для периодического refresh/fetch), поэтому проще
 # и безопаснее открывать короткое соединение на каждую операцию, а не держать
@@ -540,6 +851,21 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sensor_ts ON sensor_history(ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_token_ts ON token_history(ts)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS voltage_charge_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_start TEXT NOT NULL,
+                ts_end TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                minutes REAL,
+                v_min REAL,
+                v_peak REAL,
+                pct_start REAL,
+                pct_end REAL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_vevent_end ON voltage_charge_events(ts_end)")
+        conn.execute("CREATE TABLE IF NOT EXISTS voltage_meta (key TEXT PRIMARY KEY, value TEXT)")
 
 def log_sensor_snapshot(data):
     ts = datetime.utcnow().isoformat()
@@ -1001,6 +1327,10 @@ def fetch_sensor_data():
             check_sensor_alerts(sensors_data, data)
         except Exception as e:
             logger.error(f"Sensor alert check failed: {e}")
+        try:
+            check_voltage_alerts(data)
+        except Exception as e:
+            logger.error(f"Voltage alert check failed: {e}")
 
         sensors_data = data
         update_status("last_sensor_update")
@@ -1107,6 +1437,42 @@ def archive_status():
         "last_archive_summary": status_info["last_archive_summary"],
         "next_archive_run": status_info["next_archive_run"],
     })
+
+@app.route("/voltage_status", methods=["GET"])
+def voltage_status():
+    """Состояние мониторинга 12V АКБ + какие ключи с 'volt' реально есть в
+    последнем снимке (чтобы быстро найти правильный VOLTAGE_SENSOR_KEY)."""
+    check_auth(request)
+    sensors = (sensors_data or {}).get("sensorsData") or {}
+    st = voltage_state
+    return jsonify({
+        "sensor_key_used": st["key"],
+        "voltage_keys_in_last_snapshot": {k: v for k, v in sensors.items() if re.search(r"volt", k, re.I)},
+        "last_value": st["value"], "last_value_ts": st["ts"],
+        "low_level": st["low_level"], "low_since_seconds_ago": (time.time() - st["low_since"]) if st["low_since"] else None,
+        "charging": st["charging"], "charge_in_progress": st["charge"],
+        "thresholds": {
+            "low_warn": VOLTAGE_LOW_WARN, "low_crit": VOLTAGE_LOW_CRIT, "low_recover": VOLTAGE_LOW_RECOVER,
+            "low_confirm_minutes": VOLTAGE_LOW_CONFIRM_MINUTES, "low_crit_confirm_minutes": VOLTAGE_LOW_CRIT_CONFIRM_MINUTES,
+            "charge_on": VOLTAGE_CHARGE_ON, "charge_off": VOLTAGE_CHARGE_OFF,
+            "confirm_snapshots": VOLTAGE_CONFIRM_SNAPSHOTS, "reminder_hours": VOLTAGE_LOW_REMINDER_HOURS,
+        },
+        "digest": {"time": VOLTAGE_DIGEST_TIME, "tz": VOLTAGE_DIGEST_TZ, "charge_notify": VOLTAGE_CHARGE_NOTIFY,
+                   "last_sent_date": _meta_get("digest_last_date")},
+    })
+
+@app.route("/voltage_digest", methods=["GET"])
+def voltage_digest():
+    """Предпросмотр суточной сводки (за 24 ч до текущего момента). С ?send=1 —
+    ещё и отправляет её админам (нужен RW-ключ)."""
+    if request.args.get("send") == "1":
+        check_auth_rw(request)
+    else:
+        check_auth(request)
+    text = build_voltage_digest(datetime.now(_digest_tz()))
+    if request.args.get("send") == "1":
+        notify_admins("voltage_charge", text)
+    return Response(text, mimetype="text/plain; charset=utf-8")
 
 @app.route("/set_tokens", methods=["POST"])
 def set_tokens():
@@ -1353,6 +1719,7 @@ if __name__ == "__main__":
     archive_and_cleanup_history()
     periodic_refresh()
     periodic_fetch()
+    voltage_digest_tick()
 
     logger.info("App started")
     app.run(host=LISTEN, port=PORT)
